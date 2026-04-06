@@ -40,14 +40,19 @@ def _createdb() -> bool:
         if b"already exists" in e.stderr:
             return True
         return False
+    except FileNotFoundError:
+        return False
 
 
 def _dropdb() -> None:
     """Drop the test database, ignoring errors."""
-    subprocess.run(
-        ["dropdb", "-U", PG_USER, "--if-exists", TEST_DB_NAME],
-        capture_output=True, check=False,
-    )
+    try:
+        subprocess.run(
+            ["dropdb", "-U", PG_USER, "--if-exists", TEST_DB_NAME],
+            capture_output=True, check=False,
+        )
+    except FileNotFoundError:
+        pass
 
 
 # Skip the whole module if we can't reach PG

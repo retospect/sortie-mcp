@@ -305,7 +305,7 @@ state, you decide what to do next.
 {self._format_steps(pending[:10])}
 
 ## Recent notes
-{chr(10).join(f"- [{", ".join(n.tags)}] {n.content}" for n in notes[-10:])}
+{chr(10).join("- [" + ", ".join(n.tags) + "] " + n.content for n in notes[-10:])}
 
 ## Output (JSON)
 Respond with ONLY a JSON object:

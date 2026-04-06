@@ -2,6 +2,7 @@ name: check
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   schedule:
     - cron: '6 4 3 * *'

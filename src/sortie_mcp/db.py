@@ -157,7 +157,9 @@ class DB:
             try:
                 await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             except asyncpg.InsufficientPrivilegeError:
-                log.warning("Cannot create vector extension — must be created by superuser")
+                log.warning(
+                    "Cannot create vector extension — must be created by superuser"
+                )
             sql = SCHEMA_SQL.format(schema=self.schema)
             await conn.execute(sql)
         log.info("Schema migration complete (schema=%s)", self.schema)
@@ -308,7 +310,11 @@ class DB:
         vals: list[Any] = []
         for i, (k, v) in enumerate(fields.items(), start=2):
             sets.append(f"{k} = ${i}")
-            vals.append(v.value if isinstance(v, (CampaignStatus, FailurePolicy, Priority)) else v)
+            vals.append(
+                v.value
+                if isinstance(v, (CampaignStatus, FailurePolicy, Priority))
+                else v
+            )
         sets.append("updated_at = now()")
         row = await self.pool.fetchrow(
             f"UPDATE {self._t('campaigns')} SET {', '.join(sets)} WHERE id = $1 RETURNING *",
@@ -494,7 +500,10 @@ class DB:
         if not row:
             return None
         step = self._row_to_step(row)
-        if step.status == StepStatus.FAILED and step.failure_policy == FailurePolicy.FAIL_FAST:
+        if (
+            step.status == StepStatus.FAILED
+            and step.failure_policy == FailurePolicy.FAIL_FAST
+        ):
             await self._cascade_fail_fast(step)
         return step
 
@@ -547,82 +556,79 @@ class DB:
                 "Cannot spawn subtasks."
             )
 
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                # 1. Mark current step done with partial output
-                await conn.execute(
-                    f"""
+        async with self.pool.acquire() as conn, conn.transaction():
+            # 1. Mark current step done with partial output
+            await conn.execute(
+                f"""
                     UPDATE {self._t("campaign_steps")}
                     SET status = 'done', output = $2, completed_at = now()
                     WHERE id = $1
                     """,
-                    step_id,
-                    partial_output,
-                )
+                step_id,
+                partial_output,
+            )
 
-                # 2. Create subtask steps
-                subtask_ids = []
-                for st in subtasks:
-                    fp = compute_fingerprint(
-                        st["action"], st.get("agent"), st.get("input")
-                    )
-                    row = await conn.fetchrow(
-                        f"""
+            # 2. Create subtask steps
+            subtask_ids = []
+            for st in subtasks:
+                fp = compute_fingerprint(st["action"], st.get("agent"), st.get("input"))
+                row = await conn.fetchrow(
+                    f"""
                         INSERT INTO {self._t("campaign_steps")}
                             (campaign_id, action, agent, step_type, parent_step_id,
                              depth, depends_on, input, fingerprint)
                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                         RETURNING id
                         """,
-                        step.campaign_id,
-                        st["action"],
-                        st.get("agent", step.agent),
-                        st.get("step_type", "atomic"),
-                        step_id,
-                        step.depth + 1,
-                        [step_id],
-                        st.get("input"),
-                        fp,
-                    )
-                    subtask_ids.append(row["id"])
+                    step.campaign_id,
+                    st["action"],
+                    st.get("agent", step.agent),
+                    st.get("step_type", "atomic"),
+                    step_id,
+                    step.depth + 1,
+                    [step_id],
+                    st.get("input"),
+                    fp,
+                )
+                subtask_ids.append(row["id"])
 
-                # 3. Create continuation step (inherits parent's parent_step_id
-                # and depth — same logical step split in time)
-                cont_fp = compute_fingerprint(continuation_action, step.agent, None)
-                cont_row = await conn.fetchrow(
-                    f"""
+            # 3. Create continuation step (inherits parent's parent_step_id
+            # and depth — same logical step split in time)
+            cont_fp = compute_fingerprint(continuation_action, step.agent, None)
+            cont_row = await conn.fetchrow(
+                f"""
                     INSERT INTO {self._t("campaign_steps")}
                         (campaign_id, action, agent, step_type, parent_step_id,
                          depth, depends_on, continuation_of, fingerprint)
                     VALUES ($1, $2, $3, 'atomic', $4, $5, $6, $7, $8)
                     RETURNING id
                     """,
-                    step.campaign_id,
-                    continuation_action,
-                    step.agent,
-                    step.parent_step_id,  # inherits parent's parent
-                    step.depth,  # same depth
-                    subtask_ids,
-                    step_id,
-                    cont_fp,
-                )
-                cont_id = cont_row["id"]
+                step.campaign_id,
+                continuation_action,
+                step.agent,
+                step.parent_step_id,  # inherits parent's parent
+                step.depth,  # same depth
+                subtask_ids,
+                step_id,
+                cont_fp,
+            )
+            cont_id = cont_row["id"]
 
-                # 4. Retarget downstream deps: anything that depended on
-                # this step now depends on the continuation
-                await conn.execute(
-                    f"""
+            # 4. Retarget downstream deps: anything that depended on
+            # this step now depends on the continuation
+            await conn.execute(
+                f"""
                     UPDATE {self._t("campaign_steps")}
                     SET depends_on = array_replace(depends_on, $1, $2)
                     WHERE campaign_id = $3
                       AND $1 = ANY(depends_on)
                       AND id != ALL($4::int[])
                     """,
-                    step_id,
-                    cont_id,
-                    step.campaign_id,
-                    [*subtask_ids, cont_id],
-                )
+                step_id,
+                cont_id,
+                step.campaign_id,
+                [*subtask_ids, cont_id],
+            )
 
         return {"subtask_ids": subtask_ids, "continuation_id": cont_id}
 
@@ -655,93 +661,92 @@ class DB:
                 f"Step {step_id} is not a descendant of step {target_id}. Cannot abort."
             )
 
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                # 1. Mark discoverer as done
-                await conn.execute(
-                    f"""
-                    UPDATE {self._t("campaign_steps")}
-                    SET status = 'done', output = $2, completed_at = now()
-                    WHERE id = $1
-                    """,
-                    step_id,
-                    reason,
-                )
+        async with self.pool.acquire() as conn, conn.transaction():
+            # 1. Mark discoverer as done
+            await conn.execute(
+                f"""
+                UPDATE {self._t("campaign_steps")}
+                SET status = 'done', output = $2, completed_at = now()
+                WHERE id = $1
+                """,
+                step_id,
+                reason,
+            )
 
-                # 2. Skip all pending/running descendants of target (except discoverer)
-                skipped = await conn.fetch(
+            # 2. Skip all pending/running descendants of target (except discoverer)
+            skipped = await conn.fetch(
+                f"""
+                WITH RECURSIVE descendants AS (
+                    SELECT id FROM {self._t("campaign_steps")}
+                    WHERE parent_step_id = $1 AND id != $2
+                    UNION ALL
+                    SELECT s.id FROM {self._t("campaign_steps")} s
+                    JOIN descendants d ON s.parent_step_id = d.id
+                    WHERE s.id != $2
+                )
+                UPDATE {self._t("campaign_steps")}
+                SET status = 'skipped',
+                    error = 'Branch aborted by step ' || $2
+                WHERE id IN (SELECT id FROM descendants)
+                  AND status IN ('pending', 'running')
+                RETURNING id
+                """,
+                target_id,
+                step_id,
+            )
+            skipped_ids = [r["id"] for r in skipped]
+
+            # 3. Mark target as done with output
+            await conn.execute(
+                f"""
+                UPDATE {self._t("campaign_steps")}
+                SET status = 'done', output = $2, completed_at = now()
+                WHERE id = $1
+                """,
+                target_id,
+                output,
+            )
+
+            # 4. Transitive skip cascade through depends_on graph
+            if skipped_ids:
+                cascade_result = await conn.fetch(
                     f"""
-                    WITH RECURSIVE descendants AS (
+                    WITH RECURSIVE cascade AS (
                         SELECT id FROM {self._t("campaign_steps")}
-                        WHERE parent_step_id = $1 AND id != $2
+                        WHERE id = ANY($1::int[])
                         UNION ALL
                         SELECT s.id FROM {self._t("campaign_steps")} s
-                        JOIN descendants d ON s.parent_step_id = d.id
-                        WHERE s.id != $2
+                        JOIN cascade c ON c.id = ANY(s.depends_on)
+                        WHERE s.status = 'pending'
+                          AND s.campaign_id = $2
                     )
                     UPDATE {self._t("campaign_steps")}
                     SET status = 'skipped',
-                        error = 'Branch aborted by step ' || $2
-                    WHERE id IN (SELECT id FROM descendants)
-                      AND status IN ('pending', 'running')
+                        error = 'Dependency skipped (cascade from step ' || $3 || ')'
+                    WHERE id IN (SELECT id FROM cascade)
+                      AND status = 'pending'
+                      AND id != ALL($1::int[])
                     RETURNING id
                     """,
-                    target_id,
-                    step_id,
-                )
-                skipped_ids = [r["id"] for r in skipped]
-
-                # 3. Mark target as done with output
-                await conn.execute(
-                    f"""
-                    UPDATE {self._t("campaign_steps")}
-                    SET status = 'done', output = $2, completed_at = now()
-                    WHERE id = $1
-                    """,
-                    target_id,
-                    output,
-                )
-
-                # 4. Transitive skip cascade through depends_on graph
-                if skipped_ids:
-                    cascade_result = await conn.fetch(
-                        f"""
-                        WITH RECURSIVE cascade AS (
-                            SELECT id FROM {self._t("campaign_steps")}
-                            WHERE id = ANY($1::int[])
-                            UNION ALL
-                            SELECT s.id FROM {self._t("campaign_steps")} s
-                            JOIN cascade c ON c.id = ANY(s.depends_on)
-                            WHERE s.status = 'pending'
-                              AND s.campaign_id = $2
-                        )
-                        UPDATE {self._t("campaign_steps")}
-                        SET status = 'skipped',
-                            error = 'Dependency skipped (cascade from step ' || $3 || ')'
-                        WHERE id IN (SELECT id FROM cascade)
-                          AND status = 'pending'
-                          AND id != ALL($1::int[])
-                        RETURNING id
-                        """,
-                        skipped_ids,
-                        step.campaign_id,
-                        step_id,
-                    )
-                    skipped_ids.extend(r["id"] for r in cascade_result)
-
-                # 5. Add a note with the reason
-                await conn.execute(
-                    f"""
-                    INSERT INTO {self._t("campaign_notes")}
-                        (campaign_id, step_id, agent, content, tags)
-                    VALUES ($1, $2, $3, $4, $5)
-                    """,
+                    skipped_ids,
                     step.campaign_id,
                     step_id,
-                    step.agent,
-                    f"Branch abort: {reason}",
-                    ["abort", "finding"],
                 )
+                skipped_ids.extend(r["id"] for r in cascade_result)
+
+            # 5. Add a note with the reason
+            await conn.execute(
+                f"""
+                INSERT INTO {self._t("campaign_notes")}
+                    (campaign_id, step_id, agent, content, tags)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                step.campaign_id,
+                step_id,
+                step.agent,
+                f"Branch abort: {reason}",
+                ["abort", "finding"],
+            )
 
         # Check if target's parent is now satisfied
         if target.parent_step_id is not None:
@@ -753,9 +758,7 @@ class DB:
     # Canonical resolution
     # ------------------------------------------------------------------
 
-    async def _resolve_deps(
-        self, campaign_id: UUID, dep_ids: list[int]
-    ) -> list[int]:
+    async def _resolve_deps(self, campaign_id: UUID, dep_ids: list[int]) -> list[int]:
         """Resolve each dep ID to its latest continuation."""
         if not dep_ids:
             return []
@@ -834,8 +837,7 @@ class DB:
                 parent_id,
             )
             summary = "\n\n".join(
-                f"[{c['status']}] {c['action']}: {c['output']}"
-                for c in child_outputs
+                f"[{c['status']}] {c['action']}: {c['output']}" for c in child_outputs
             )
             await self.complete_step(parent_id, summary)
 
@@ -853,10 +855,9 @@ class DB:
             return
 
         # Skip siblings and cascade
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                skipped = await conn.fetch(
-                    f"""
+        async with self.pool.acquire() as conn, conn.transaction():
+            skipped = await conn.fetch(
+                f"""
                     UPDATE {self._t("campaign_steps")}
                     SET status = 'skipped',
                         error = 'Sibling failed with fail_fast (step ' || $2 || ')'
@@ -865,28 +866,28 @@ class DB:
                       AND id != $2
                     RETURNING id
                     """,
-                    failed_step.parent_step_id,
-                    failed_step.id,
-                )
-                skipped_ids = [r["id"] for r in skipped]
+                failed_step.parent_step_id,
+                failed_step.id,
+            )
+            skipped_ids = [r["id"] for r in skipped]
 
-                # Mark parent as failed
-                await conn.execute(
-                    f"""
+            # Mark parent as failed
+            await conn.execute(
+                f"""
                     UPDATE {self._t("campaign_steps")}
                     SET status = 'failed',
                         error = 'Child step ' || $2 || ' failed with fail_fast',
                         completed_at = now()
                     WHERE id = $1
                     """,
-                    failed_step.parent_step_id,
-                    failed_step.id,
-                )
+                failed_step.parent_step_id,
+                failed_step.id,
+            )
 
-                # Transitive skip cascade
-                if skipped_ids:
-                    await conn.execute(
-                        f"""
+            # Transitive skip cascade
+            if skipped_ids:
+                await conn.execute(
+                    f"""
                         WITH RECURSIVE cascade AS (
                             SELECT id FROM {self._t("campaign_steps")}
                             WHERE id = ANY($1::int[])
@@ -903,9 +904,9 @@ class DB:
                           AND status = 'pending'
                           AND id != ALL($1::int[])
                         """,
-                        skipped_ids,
-                        failed_step.campaign_id,
-                    )
+                    skipped_ids,
+                    failed_step.campaign_id,
+                )
 
     # ------------------------------------------------------------------
     # Notes
@@ -1058,9 +1059,7 @@ class DB:
         )
         return [self._row_to_campaign(r) for r in rows]
 
-    async def find_duplicate(
-        self, campaign_id: UUID, fingerprint: str
-    ) -> Step | None:
+    async def find_duplicate(self, campaign_id: UUID, fingerprint: str) -> Step | None:
         """Advisory dedup: find a completed step with the same fingerprint."""
         row = await self.pool.fetchrow(
             f"""

@@ -6,6 +6,8 @@ from dataclasses import fields
 from uuid import uuid4
 
 from sortie_mcp.models import (
+    PRIORITY_ORDER,
+    SEP,
     Campaign,
     CampaignStatus,
     FailurePolicy,
@@ -18,10 +20,7 @@ from sortie_mcp.models import (
     StepStatus,
     StepType,
     compute_fingerprint,
-    PRIORITY_ORDER,
-    SEP,
 )
-
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -172,10 +171,24 @@ class TestCampaignDataclass:
     def test_all_fields_present(self) -> None:
         field_names = {f.name for f in fields(Campaign)}
         expected = {
-            "id", "name", "goal", "status", "strategy", "progress", "channel",
-            "user_id", "max_depth", "token_budget", "tokens_used",
-            "failure_policy", "priority", "next_action_at", "last_reported_at",
-            "created_at", "updated_at", "completed_at",
+            "id",
+            "name",
+            "goal",
+            "status",
+            "strategy",
+            "progress",
+            "channel",
+            "user_id",
+            "max_depth",
+            "token_budget",
+            "tokens_used",
+            "failure_policy",
+            "priority",
+            "next_action_at",
+            "last_reported_at",
+            "created_at",
+            "updated_at",
+            "completed_at",
         }
         assert field_names == expected
 
@@ -251,8 +264,11 @@ class TestStepPlan:
         for child in plan.steps:
             assert isinstance(child, StepPlan)
 
-    def test_for_each_template_has_placeholders(self, sample_for_each_plan: StepPlan) -> None:
+    def test_for_each_template_has_placeholders(
+        self, sample_for_each_plan: StepPlan
+    ) -> None:
         import json
+
         template_json = json.dumps(sample_for_each_plan.template)
         assert "{item." in template_json
 

@@ -9,6 +9,7 @@ Automatically creates/drops a ``sortie_test`` database using the local
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 
@@ -21,11 +22,9 @@ PG_USER = "bots"
 
 def _pg_is_reachable() -> bool:
     """Quick check: can we reach local PG or the one in DATABASE_URL?"""
-    try:
-        import asyncpg  # noqa: F811
-        return True
-    except ImportError:
-        return False
+    import importlib.util
+
+    return importlib.util.find_spec("asyncpg") is not None
 
 
 def _createdb() -> bool:
@@ -33,26 +32,24 @@ def _createdb() -> bool:
     try:
         subprocess.run(
             ["createdb", "-U", PG_USER, TEST_DB_NAME],
-            capture_output=True, check=True,
+            capture_output=True,
+            check=True,
         )
         return True
     except subprocess.CalledProcessError as e:
-        if b"already exists" in e.stderr:
-            return True
-        return False
+        return b"already exists" in e.stderr
     except FileNotFoundError:
         return False
 
 
 def _dropdb() -> None:
     """Drop the test database, ignoring errors."""
-    try:
+    with contextlib.suppress(FileNotFoundError):
         subprocess.run(
             ["dropdb", "-U", PG_USER, "--if-exists", TEST_DB_NAME],
-            capture_output=True, check=False,
+            capture_output=True,
+            check=False,
         )
-    except FileNotFoundError:
-        pass
 
 
 # Skip the whole module if we can't reach PG
@@ -72,9 +69,17 @@ def _test_database():
     _createdb()
     # Install pgvector extension
     subprocess.run(
-        ["psql", "-U", PG_USER, "-d", TEST_DB_NAME,
-         "-c", "CREATE EXTENSION IF NOT EXISTS vector;"],
-        capture_output=True, check=False,
+        [
+            "psql",
+            "-U",
+            PG_USER,
+            "-d",
+            TEST_DB_NAME,
+            "-c",
+            "CREATE EXTENSION IF NOT EXISTS vector;",
+        ],
+        capture_output=True,
+        check=False,
     )
     yield
     _dropdb()
@@ -212,9 +217,7 @@ class TestStepCRUD:
 
     async def test_fail_step_exhausted(self, db) -> None:
         campaign = await db.create_campaign("Goal")
-        step = await db.add_step(
-            campaign.id, "Step 1", agent="research"
-        )
+        step = await db.add_step(campaign.id, "Step 1", agent="research")
         # Exhaust retries
         for i in range(3):
             await db.claim_step(step.id)
@@ -324,17 +327,26 @@ class TestAbortBranch:
             campaign.id, "Exosome approach", step_type="sequence"
         )
         step_a = await db.add_step(
-            campaign.id, "Find papers", agent="research",
-            parent_step_id=parent.id, depth=1,
+            campaign.id,
+            "Find papers",
+            agent="research",
+            parent_step_id=parent.id,
+            depth=1,
         )
         step_b = await db.add_step(
-            campaign.id, "Read papers", agent="research",
-            parent_step_id=parent.id, depth=1,
+            campaign.id,
+            "Read papers",
+            agent="research",
+            parent_step_id=parent.id,
+            depth=1,
             depends_on=[step_a.id],
         )
         step_c = await db.add_step(
-            campaign.id, "Write summary", agent="writing",
-            parent_step_id=parent.id, depth=1,
+            campaign.id,
+            "Write summary",
+            agent="writing",
+            parent_step_id=parent.id,
+            depth=1,
             depends_on=[step_b.id],
         )
 

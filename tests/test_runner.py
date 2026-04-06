@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -12,17 +11,14 @@ from sortie_mcp.models import (
     Campaign,
     CampaignStatus,
     FailurePolicy,
-    Note,
     Notification,
     NotificationLevel,
     Priority,
     Step,
     StepStatus,
     StepType,
-    PRIORITY_ORDER,
 )
 from sortie_mcp.runner import Runner
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -115,7 +111,9 @@ class TestRunnerTick:
         mock_db.count_running.return_value = 0
         mock_db.get_due_campaigns.return_value = [campaign]
         mock_db.get_undelivered_notifications.return_value = []
-        with patch.object(runner, "_dispatch_campaign", new_callable=AsyncMock, return_value=1):
+        with patch.object(
+            runner, "_dispatch_campaign", new_callable=AsyncMock, return_value=1
+        ):
             await runner.tick()
             runner._dispatch_campaign.assert_awaited()
 
@@ -123,8 +121,11 @@ class TestRunnerTick:
         mock_db.reset_zombies.return_value = 0
         mock_db.count_running.return_value = 4  # At capacity
         notif = Notification(
-            id=1, campaign_id=uuid4(), channel="research",
-            message="Phase 1 done", level=NotificationLevel.MILESTONE,
+            id=1,
+            campaign_id=uuid4(),
+            channel="research",
+            message="Phase 1 done",
+            level=NotificationLevel.MILESTONE,
         )
         mock_db.get_undelivered_notifications.return_value = [notif]
         mock_db.mark_delivered = AsyncMock()
@@ -159,7 +160,9 @@ class TestPriorityScheduling:
         assert Priority.URGENT in dispatched
         assert dispatched[Priority.URGENT] >= 1
 
-    async def test_multiple_campaigns_same_tier_share_slots(self, runner, mock_db) -> None:
+    async def test_multiple_campaigns_same_tier_share_slots(
+        self, runner, mock_db
+    ) -> None:
         c1 = make_campaign(priority=Priority.NORMAL, name="C1")
         c2 = make_campaign(priority=Priority.NORMAL, name="C2")
         mock_db.reset_zombies.return_value = 0
@@ -192,7 +195,11 @@ class TestDispatchCampaign:
         campaign = make_campaign()
         step = make_step(campaign_id=campaign.id, id=42)
         mock_db.get_ready_steps.return_value = [step]
-        mock_db.claim_step.return_value = step._replace(status=StepStatus.RUNNING) if hasattr(step, '_replace') else step
+        mock_db.claim_step.return_value = (
+            step._replace(status=StepStatus.RUNNING)
+            if hasattr(step, "_replace")
+            else step
+        )
 
         # claim_step returns the claimed step
         claimed = make_step(campaign_id=campaign.id, id=42, status=StepStatus.RUNNING)
@@ -273,7 +280,9 @@ class TestBuildStepContext:
         ctx = await runner._build_step_context(step, campaign)
         assert "spawn_and_continue" not in ctx
 
-    async def test_spawn_instruction_shown_below_max_depth(self, runner, mock_db) -> None:
+    async def test_spawn_instruction_shown_below_max_depth(
+        self, runner, mock_db
+    ) -> None:
         campaign = make_campaign(max_depth=4)
         step = make_step(campaign_id=campaign.id, depth=2)
         mock_db.get_notes.return_value = []
@@ -302,8 +311,15 @@ class TestToolVisibility:
         assert "spawn_and_continue" in tools
 
     def test_all_base_tools_always_present(self, runner) -> None:
-        base = {"get_my_context", "add_note", "search_notes", "get_notes",
-                "complete_step", "fail_step", "abort_branch"}
+        base = {
+            "get_my_context",
+            "add_note",
+            "search_notes",
+            "get_notes",
+            "complete_step",
+            "fail_step",
+            "abort_branch",
+        }
         for depth in range(5):
             tools = set(runner._get_tools_for_depth(depth, max_depth=4))
             assert base.issubset(tools)
@@ -338,7 +354,10 @@ class TestTemplateExpansion:
         }
         item = {"id": "para_20", "context": "Current synthesis via solvothermal"}
         result = runner._expand_template(template, item)
-        assert result["steps"][0]["action"] == "Find citations for Current synthesis via solvothermal"
+        assert (
+            result["steps"][0]["action"]
+            == "Find citations for Current synthesis via solvothermal"
+        )
         assert result["steps"][1]["action"] == "Write improved para_20"
 
     def test_no_placeholders_passthrough(self, runner) -> None:

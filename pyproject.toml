@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sortie-mcp"
-version = "0.1.1"
+version = "0.1.2"
 description = "Campaign orchestration MCP server for AI agents — dependency DAGs, parallel fan-out, failure policies"
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -60,6 +60,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 ignore = [
     "B008",    # function-call-in-default-argument (fastmcp pattern)
     "E501",    # line-too-long (formatter handles what it can)
+    "RUF001",  # ambiguous-unicode-character (› separator is intentional)
     "SIM108",  # if-else-block-instead-of-if-exp (readability)
 ]
 

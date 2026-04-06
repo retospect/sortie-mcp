@@ -5,13 +5,9 @@ from __future__ import annotations
 import pytest
 
 from sortie_mcp.models import (
-    Campaign,
-    CampaignStatus,
     FailurePolicy,
     Priority,
-    Step,
     StepPlan,
-    StepStatus,
     StepType,
 )
 

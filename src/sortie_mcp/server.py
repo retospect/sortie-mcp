@@ -8,10 +8,8 @@ Three perspectives on one server:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
-import sys
 from typing import Any
 from uuid import UUID
 
@@ -20,8 +18,6 @@ from mcp.server.fastmcp import FastMCP
 from .db import DB
 from .models import (
     CampaignStatus,
-    FailurePolicy,
-    NotificationLevel,
     Priority,
     StepStatus,
 )
@@ -150,7 +146,8 @@ async def get_campaign(id: str) -> dict[str, Any]:
 
     # Only return notes since last report
     recent_notes = [
-        n for n in notes
+        n
+        for n in notes
         if campaign.last_reported_at is None
         or (n.created_at and n.created_at > campaign.last_reported_at)
     ]
@@ -211,28 +208,33 @@ async def get_updates(id: str | None = None) -> dict[str, Any]:
         steps = await db.get_steps(c.id)
         notes = await db.get_notes(c.id)
         recent = [
-            s for s in steps
+            s
+            for s in steps
             if c.last_reported_at is None
             or (s.completed_at and s.completed_at > c.last_reported_at)
         ]
         recent_notes = [
-            n for n in notes
+            n
+            for n in notes
             if c.last_reported_at is None
             or (n.created_at and n.created_at > c.last_reported_at)
         ]
         await db.set_last_reported(c.id)
-        updates.append({
-            "campaign_id": str(c.id),
-            "name": c.name,
-            "completed": [
-                {"id": s.id, "action": s.action, "status": s.status.value}
-                for s in recent if s.status in (StepStatus.DONE, StepStatus.FAILED, StepStatus.SKIPPED)
-            ],
-            "notes": [
-                {"content": n.content, "tags": n.tags}
-                for n in recent_notes[:10]
-            ],
-        })
+        updates.append(
+            {
+                "campaign_id": str(c.id),
+                "name": c.name,
+                "completed": [
+                    {"id": s.id, "action": s.action, "status": s.status.value}
+                    for s in recent
+                    if s.status
+                    in (StepStatus.DONE, StepStatus.FAILED, StepStatus.SKIPPED)
+                ],
+                "notes": [
+                    {"content": n.content, "tags": n.tags} for n in recent_notes[:10]
+                ],
+            }
+        )
     return {"updates": updates}
 
 
@@ -281,9 +283,7 @@ async def resume_campaign(id: str) -> dict[str, str]:
         id: Campaign UUID.
     """
     db = await get_db()
-    await db.update_campaign(
-        UUID(id), status=CampaignStatus.ACTIVE
-    )
+    await db.update_campaign(UUID(id), status=CampaignStatus.ACTIVE)
     return {"id": id, "status": "active"}
 
 
@@ -339,11 +339,13 @@ async def get_my_context(step_id: int) -> dict[str, Any]:
         for dep_id in step.depends_on:
             dep = await db.get_step(dep_id)
             if dep and dep.output:
-                upstream.append({
-                    "step_id": dep.id,
-                    "action": dep.action,
-                    "output": dep.output,
-                })
+                upstream.append(
+                    {
+                        "step_id": dep.id,
+                        "action": dep.action,
+                        "output": dep.output,
+                    }
+                )
 
     # Get relevant notes (most recent)
     notes = await db.get_notes(step.campaign_id)

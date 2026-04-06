@@ -23,6 +23,7 @@ import httpx
 
 from .db import DB
 from .models import (
+    PRIORITY_ORDER,
     Campaign,
     CampaignStatus,
     FailurePolicy,
@@ -31,7 +32,6 @@ from .models import (
     Step,
     StepStatus,
     StepType,
-    PRIORITY_ORDER,
 )
 
 log = logging.getLogger(__name__)
@@ -76,7 +76,12 @@ class Runner:
         # 2. Check capacity
         running = await self.db.count_running()
         available = MAX_CONCURRENT_STEPS - running
-        log.info("Capacity: %d/%d running, %d slots free", running, MAX_CONCURRENT_STEPS, available)
+        log.info(
+            "Capacity: %d/%d running, %d slots free",
+            running,
+            MAX_CONCURRENT_STEPS,
+            available,
+        )
 
         if available <= 0:
             # At capacity — just check for stuck campaigns
@@ -130,7 +135,11 @@ class Runner:
 
         if not ready:
             # No ready steps — consult planner for new steps
-            log.info("Campaign %s (%s): no ready steps, consulting planner", campaign.name, campaign.id)
+            log.info(
+                "Campaign %s (%s): no ready steps, consulting planner",
+                campaign.name,
+                campaign.id,
+            )
             await self._consult_planner(campaign)
             # Re-check after planner adds steps
             ready = await self.db.get_ready_steps(campaign.id)
@@ -139,9 +148,17 @@ class Runner:
         for step in ready[:max_slots]:
             claimed = await self.db.claim_step(step.id)
             if claimed:
-                log.info("Dispatching step %d: %s (agent=%s)", step.id, step.action[:80], step.agent)
+                log.info(
+                    "Dispatching step %d: %s (agent=%s)",
+                    step.id,
+                    step.action[:80],
+                    step.agent,
+                )
                 # Fire-and-forget dispatch to OpenClaw runtime
-                asyncio.create_task(self._execute_step(claimed, campaign))
+                task = asyncio.create_task(self._execute_step(claimed, campaign))
+                task.add_done_callback(
+                    lambda t: t.exception() if not t.cancelled() else None
+                )
                 dispatched += 1
 
         return dispatched
@@ -176,8 +193,12 @@ class Runner:
                         duration_ms=result.get("duration_ms"),
                     )
             else:
-                log.error("Runtime returned %d for step %d", response.status_code, step.id)
-                await self.db.fail_step(step.id, f"Runtime error: HTTP {response.status_code}")
+                log.error(
+                    "Runtime returned %d for step %d", response.status_code, step.id
+                )
+                await self.db.fail_step(
+                    step.id, f"Runtime error: HTTP {response.status_code}"
+                )
 
         except Exception as e:
             log.exception("Failed to execute step %d", step.id)
@@ -207,15 +228,15 @@ class Runner:
             )
 
         return f"""## Campaign context (sortie)
-**Campaign**: {campaign.name or 'Unnamed'}
+**Campaign**: {campaign.name or "Unnamed"}
 **Goal**: {campaign.goal}
 **Your task**: {step.action}
 
 ### Upstream context
-{upstream_text or 'No upstream outputs yet.'}
+{upstream_text or "No upstream outputs yet."}
 
 ### Relevant notes from other steps
-{notes_text or 'No notes yet.'}
+{notes_text or "No notes yet."}
 
 ### Instructions
 1. Do the work using your own tools (perplexity, precis, etc.)
@@ -269,10 +290,10 @@ state, you decide what to do next.
 
 ## Campaign
 **Goal**: {campaign.goal}
-**Strategy**: {campaign.strategy or 'Not yet defined'}
-**Progress**: {campaign.progress or 'Just started'}
+**Strategy**: {campaign.strategy or "Not yet defined"}
+**Progress**: {campaign.progress or "Just started"}
 **Max depth**: {campaign.max_depth}
-**Tokens used**: {campaign.tokens_used}/{campaign.token_budget or 'unlimited'}
+**Tokens used**: {campaign.tokens_used}/{campaign.token_budget or "unlimited"}
 
 ## Recently completed steps
 {self._format_steps(completed[-10:])}
@@ -284,7 +305,7 @@ state, you decide what to do next.
 {self._format_steps(pending[:10])}
 
 ## Recent notes
-{chr(10).join(f'- [{", ".join(n.tags)}] {n.content}' for n in notes[-10:])}
+{chr(10).join(f"- [{", ".join(n.tags)}] {n.content}" for n in notes[-10:])}
 
 ## Output (JSON)
 Respond with ONLY a JSON object:
@@ -310,7 +331,7 @@ Respond with ONLY a JSON object:
 - For failures: retry, alternative, skip, or escalate. You decide.
 - Set notify.level = "milestone" when a phase completes.
 - Set notify.level = "error" when stuck and needs human attention.
-- Token budget: {campaign.token_budget or 'unlimited'} ({campaign.tokens_used} used). Wrap up if low.
+- Token budget: {campaign.token_budget or "unlimited"} ({campaign.tokens_used} used). Wrap up if low.
 """
 
         try:
@@ -321,7 +342,9 @@ Respond with ONLY a JSON object:
                     "messages": [{"role": "user", "content": prompt}],
                     "response_format": {"type": "json_object"},
                 },
-                headers={"Authorization": f"Bearer {LITELLM_KEY}"} if LITELLM_KEY else {},
+                headers={"Authorization": f"Bearer {LITELLM_KEY}"}
+                if LITELLM_KEY
+                else {},
             )
 
             if response.status_code != 200:
@@ -332,13 +355,18 @@ Respond with ONLY a JSON object:
             content = result["choices"][0]["message"]["content"]
 
             import json
+
             plan = json.loads(content)
 
             # Apply planner decisions
             if plan.get("strategy_update"):
-                await self.db.update_campaign(campaign.id, strategy=plan["strategy_update"])
+                await self.db.update_campaign(
+                    campaign.id, strategy=plan["strategy_update"]
+                )
             if plan.get("progress_update"):
-                await self.db.update_campaign(campaign.id, progress=plan["progress_update"])
+                await self.db.update_campaign(
+                    campaign.id, progress=plan["progress_update"]
+                )
             if plan.get("done"):
                 await self.db.update_campaign(
                     campaign.id,
@@ -359,15 +387,17 @@ Respond with ONLY a JSON object:
 
             # Handle notifications
             notify = plan.get("notify", {})
-            if notify.get("message") and notify.get("level", "none") != "none":
-                if campaign.channel:
-                    from .models import NotificationLevel
-                    await self.db.notify(
-                        campaign.id,
-                        campaign.channel,
-                        notify["message"],
-                        level=NotificationLevel(notify["level"]),
-                    )
+            if (
+                notify.get("message")
+                and notify.get("level", "none") != "none"
+                and campaign.channel
+            ):
+                await self.db.notify(
+                    campaign.id,
+                    campaign.channel,
+                    notify["message"],
+                    level=NotificationLevel(notify["level"]),
+                )
 
             # Schedule next action
             delay = plan.get("next_delay_minutes", 15)
@@ -381,7 +411,12 @@ Respond with ONLY a JSON object:
             log.exception("Planner consultation failed for campaign %s", campaign.id)
 
     async def _add_planned_step(
-        self, campaign: Campaign, plan: dict[str, Any], *, parent_id: int | None = None, depth: int = 0
+        self,
+        campaign: Campaign,
+        plan: dict[str, Any],
+        *,
+        parent_id: int | None = None,
+        depth: int = 0,
     ) -> int | None:
         """Recursively add a planned step and its children."""
         step_type = plan.get("step_type", "atomic")
@@ -441,9 +476,12 @@ Respond with ONLY a JSON object:
 
         return step.id
 
-    def _expand_template(self, template: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    def _expand_template(
+        self, template: dict[str, Any], item: dict[str, Any]
+    ) -> dict[str, Any]:
         """Replace {item.*} placeholders in a template with actual item values."""
         import json
+
         text = json.dumps(template)
         for key, value in item.items():
             text = text.replace(f"{{item.{key}}}", str(value))
@@ -485,7 +523,6 @@ Respond with ONLY a JSON object:
         if delivered_ids:
             await self.db.mark_delivered(delivered_ids)
             log.info("Delivered %d notifications", len(delivered_ids))
-
 
 
 # ---------------------------------------------------------------------------

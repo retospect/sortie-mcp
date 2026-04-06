@@ -49,11 +49,11 @@ def make_campaign(**overrides) -> Campaign:
         completed_at=None,
     )
     defaults.update(overrides)
-    return Campaign(**defaults)
+    return Campaign(**defaults)  # type: ignore[arg-type]
 
 
-def make_step(campaign_id=None, **overrides) -> Step:
-    defaults = dict(
+def make_step(campaign_id=None, **overrides: object) -> Step:
+    defaults: dict[str, object] = dict(
         id=1,
         campaign_id=campaign_id or uuid4(),
         action="Test step",
@@ -79,7 +79,7 @@ def make_step(campaign_id=None, **overrides) -> Step:
         completed_at=None,
     )
     defaults.update(overrides)
-    return Step(**defaults)
+    return Step(**defaults)  # type: ignore[arg-type]
 
 
 def make_note(campaign_id=None, **overrides) -> Note:
@@ -94,7 +94,7 @@ def make_note(campaign_id=None, **overrides) -> Note:
         created_at=_now(),
     )
     defaults.update(overrides)
-    return Note(**defaults)
+    return Note(**defaults)  # type: ignore[arg-type]
 
 
 def mock_db():

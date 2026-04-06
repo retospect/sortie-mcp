@@ -39,11 +39,11 @@ def make_campaign(**overrides) -> Campaign:
         channel="research",
     )
     defaults.update(overrides)
-    return Campaign(**defaults)
+    return Campaign(**defaults)  # type: ignore[arg-type]
 
 
-def make_step(campaign_id=None, **overrides) -> Step:
-    defaults = dict(
+def make_step(campaign_id=None, **overrides: object) -> Step:
+    defaults: dict[str, object] = dict(
         id=1,
         campaign_id=campaign_id or uuid4(),
         action="Test step",
@@ -57,7 +57,7 @@ def make_step(campaign_id=None, **overrides) -> Step:
         max_retries=3,
     )
     defaults.update(overrides)
-    return Step(**defaults)
+    return Step(**defaults)  # type: ignore[arg-type]
 
 
 @pytest.fixture

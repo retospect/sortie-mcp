@@ -50,4 +50,4 @@ jobs:
       - uses: actions/attest-build-provenance@1c608d11d69870c2092266b3f9a6f3abbf17002c
         with:
           subject-path: dist/*
-      - uses: pypa/gh-action-pypi-publish@76f52bc884231f62b54f72e44af3f3df29834c22
+      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e

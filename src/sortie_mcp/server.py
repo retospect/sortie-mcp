@@ -17,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .db import DB
 from .models import (
+    Campaign,
     CampaignStatus,
     Priority,
     StepStatus,
@@ -197,9 +198,10 @@ async def get_updates(id: str | None = None) -> dict[str, Any]:
     Returns: Recent completions, failures, and notes.
     """
     db = await get_db()
+    campaigns: list[Campaign]
     if id:
-        campaigns = [await db.get_campaign(UUID(id))]
-        campaigns = [c for c in campaigns if c]
+        found = await db.get_campaign(UUID(id))
+        campaigns = [found] if found else []
     else:
         campaigns = await db.list_campaigns(status=CampaignStatus.ACTIVE)
 

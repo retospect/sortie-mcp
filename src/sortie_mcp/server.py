@@ -4,13 +4,31 @@ Three perspectives on one server:
 - Coordinator (Asa): create, list, get, steer, pause/resume/cancel campaigns
 - Worker (agents): get_my_context, add_note, search_notes, complete_step, etc.
 - Executor tools are Python internal API (see db.py), not MCP-exposed.
+
+Role gating
+-----------
+Each process serves exactly one role, selected via ``$SORTIE_ROLE``:
+
+- ``coordinator`` — coordinator-only tools registered. Agent-side tools
+  (``get_my_context``, ``complete_step``, ``heartbeat``, …) are hidden
+  so Asa's prompt doesn't waste tokens on tool schemas it can never use.
+- ``worker`` — worker-only tools registered. Campaign-management tools
+  are hidden from agents that should only be operating on their own step.
+- ``both`` (default) — everything registered, as in v0.1.
+
+Session binding
+---------------
+Worker tools default their ``step_id`` / ``claim_token`` arguments from
+``$SORTIE_STEP_ID`` / ``$SORTIE_CLAIM_TOKEN`` so agents don't have to
+re-state their own identity on every call. See :mod:`sortie_mcp.session`.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 from uuid import UUID
 
 from mcp.server.fastmcp import FastMCP
@@ -21,6 +39,11 @@ from .models import (
     CampaignStatus,
     Priority,
     StepStatus,
+)
+from .session import (
+    resolve_step_id,
+    session_claim_token,
+    session_role,
 )
 
 log = logging.getLogger(__name__)
@@ -51,11 +74,94 @@ async def get_db() -> DB:
 
 
 # ---------------------------------------------------------------------------
+# Role-gated tool registration
+# ---------------------------------------------------------------------------
+#
+# Reading ``SORTIE_ROLE`` ONCE at module import is deliberate: FastMCP
+# registers tools eagerly via decorators, and the set of registered tools
+# must be stable across an MCP session. Tests that want to exercise a
+# specific role import server.py inside a ``monkeypatch.setenv`` block.
+
+_ACTIVE_ROLE = session_role()
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def coordinator_tool() -> Callable[[F], F]:
+    """Register a coordinator-facing tool (create/list/steer/…).
+
+    No-op decorator when ``$SORTIE_ROLE=worker``.
+    """
+
+    def _decorate(fn: F) -> F:
+        if _ACTIVE_ROLE in ("coordinator", "both"):
+            return mcp.tool()(fn)  # type: ignore[return-value]
+        return fn
+
+    return _decorate
+
+
+def worker_tool() -> Callable[[F], F]:
+    """Register a worker-facing tool (get_my_context/complete_step/…).
+
+    No-op decorator when ``$SORTIE_ROLE=coordinator``.
+    """
+
+    def _decorate(fn: F) -> F:
+        if _ACTIVE_ROLE in ("worker", "both"):
+            return mcp.tool()(fn)  # type: ignore[return-value]
+        return fn
+
+    return _decorate
+
+
+# ---------------------------------------------------------------------------
+# Preview helpers — token-economy for large step outputs
+# ---------------------------------------------------------------------------
+
+# Token budget for upstream outputs bundled into ``get_my_context``.
+# Each upstream step gets up to HEAD chars from the top and TAIL chars
+# from the end — agents can ``read_step_output(step_id)`` for the rest.
+PREVIEW_HEAD_CHARS = int(os.environ.get("SORTIE_PREVIEW_HEAD", "600"))
+PREVIEW_TAIL_CHARS = int(os.environ.get("SORTIE_PREVIEW_TAIL", "200"))
+
+
+def _preview(text: str | None) -> dict[str, Any]:
+    """Return head+tail preview with metadata.
+
+    Shape::
+
+        {
+            "preview": "<head>\n…[ELIDED N chars]…\n<tail>",
+            "total_chars": N,
+            "truncated": True|False,
+            "hint": "call read_step_output(<id>) for full text",  # only when truncated
+        }
+
+    For text shorter than ``HEAD + TAIL`` the full string is returned
+    with ``truncated=False`` and no elision marker.
+    """
+    if not text:
+        return {"preview": "", "total_chars": 0, "truncated": False}
+    n = len(text)
+    if n <= PREVIEW_HEAD_CHARS + PREVIEW_TAIL_CHARS:
+        return {"preview": text, "total_chars": n, "truncated": False}
+    elided = n - PREVIEW_HEAD_CHARS - PREVIEW_TAIL_CHARS
+    head = text[:PREVIEW_HEAD_CHARS]
+    tail = text[-PREVIEW_TAIL_CHARS:]
+    return {
+        "preview": f"{head}\n…[ELIDED {elided} chars]…\n{tail}",
+        "total_chars": n,
+        "truncated": True,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Coordinator tools (Asa)
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@coordinator_tool()
 async def create_campaign(
     goal: str,
     name: str | None = None,
@@ -100,7 +206,7 @@ async def create_campaign(
     }
 
 
-@mcp.tool()
+@coordinator_tool()
 async def list_campaigns(status: str | None = None) -> list[dict[str, Any]]:
     """List campaigns, optionally filtered by status.
 
@@ -125,7 +231,7 @@ async def list_campaigns(status: str | None = None) -> list[dict[str, Any]]:
     ]
 
 
-@mcp.tool()
+@coordinator_tool()
 async def get_campaign(id: str) -> dict[str, Any]:
     """Get full campaign state: goal, strategy, progress, step tree, recent notes.
 
@@ -188,7 +294,7 @@ async def get_campaign(id: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@coordinator_tool()
 async def get_updates(id: str | None = None) -> dict[str, Any]:
     """Get delta since last report: completed steps, failures, new notes.
 
@@ -240,7 +346,7 @@ async def get_updates(id: str | None = None) -> dict[str, Any]:
     return {"updates": updates}
 
 
-@mcp.tool()
+@coordinator_tool()
 async def steer_campaign(id: str, guidance: str) -> dict[str, Any]:
     """Change campaign direction. Updates strategy for the planner.
 
@@ -265,7 +371,7 @@ async def steer_campaign(id: str, guidance: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@coordinator_tool()
 async def pause_campaign(id: str) -> dict[str, str]:
     """Pause a campaign. Running steps finish but no new ones start.
 
@@ -277,7 +383,7 @@ async def pause_campaign(id: str) -> dict[str, str]:
     return {"id": id, "status": "paused"}
 
 
-@mcp.tool()
+@coordinator_tool()
 async def resume_campaign(id: str) -> dict[str, str]:
     """Resume a paused campaign.
 
@@ -289,7 +395,33 @@ async def resume_campaign(id: str) -> dict[str, str]:
     return {"id": id, "status": "active"}
 
 
-@mcp.tool()
+@coordinator_tool()
+async def provide_input(id: str, step_id: int, answer: str) -> dict[str, Any]:
+    """Provide input to a step that is waiting for a human decision.
+
+    Workers call ``request_input`` when they need guidance. This tool
+    unblocks them by supplying the answer and returning the step to
+    the ready queue.
+
+    Args:
+        id: Campaign UUID.
+        step_id: The step waiting for input.
+        answer: Your decision / the information the agent asked for.
+
+    Returns: Updated step status.
+    """
+    db = await get_db()
+    step = await db.provide_input(step_id, answer)
+    if not step:
+        return {"error": f"Step {step_id} not found or not in waiting_input status"}
+    return {
+        "step_id": step.id,
+        "status": step.status.value,
+        "input_provided": True,
+    }
+
+
+@coordinator_tool()
 async def cancel_campaign(id: str) -> dict[str, Any]:
     """Cancel a campaign. All pending steps are skipped.
 
@@ -315,41 +447,62 @@ async def cancel_campaign(id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
-async def get_my_context(step_id: int) -> dict[str, Any]:
+@worker_tool()
+async def get_my_context(step_id: int | None = None) -> dict[str, Any]:
     """Get campaign context for the step you're executing.
 
+    Upstream outputs are returned as **previews** (head + tail + total
+    char count) so the context bundle stays small. Call
+    ``read_step_output(<id>)`` when you need the full body of a specific
+    upstream output.
+
     Args:
-        step_id: Your step ID (provided in your prompt).
+        step_id: Your step ID. Inferred from ``$SORTIE_STEP_ID`` if unset.
 
-    Returns: Campaign goal, your task, upstream outputs, relevant notes.
+    Returns: Campaign goal, your task, upstream output previews, notes.
 
-    Next: Do your work, then call `complete_step(step_id, summary)` or `fail_step(step_id, error)`.
+    Next: Do your work, then call ``complete_step(summary)`` or
+    ``fail_step(error)``.
     """
+    resolved = resolve_step_id(step_id)
+    if resolved is None:
+        return {
+            "error": "step_id not provided and $SORTIE_STEP_ID is unset",
+        }
     db = await get_db()
-    step = await db.get_step(step_id)
+    step = await db.get_step(resolved)
     if not step:
-        return {"error": f"Step {step_id} not found"}
+        return {"error": f"Step {resolved} not found"}
 
     campaign = await db.get_campaign(step.campaign_id)
     if not campaign:
         return {"error": "Campaign not found"}
 
-    # Get upstream outputs
-    upstream = []
+    # Upstream outputs — preview-plus-seek to keep the context bundle small.
+    upstream: list[dict[str, Any]] = []
     if step.depends_on:
         for dep_id in step.depends_on:
             dep = await db.get_step(dep_id)
             if dep and dep.output:
-                upstream.append(
-                    {
-                        "step_id": dep.id,
-                        "action": dep.action,
-                        "output": dep.output,
-                    }
-                )
+                entry: dict[str, Any] = {
+                    "step_id": dep.id,
+                    "action": dep.action,
+                    **_preview(dep.output),
+                }
+                if entry.get("truncated"):
+                    entry["hint"] = f"call read_step_output({dep.id}) for full text"
+                upstream.append(entry)
 
-    # Get relevant notes (most recent)
+    # Input (answer from a prior ``request_input``) — also preview'd.
+    input_preview: dict[str, Any] | None = None
+    if step.input:
+        input_preview = _preview(step.input)
+        if input_preview.get("truncated"):
+            input_preview["hint"] = (
+                f"call read_step_output({step.id}, field='input') for full text"
+            )
+
+    # Relevant notes (most recent).
     notes = await db.get_notes(step.campaign_id)
     recent_notes = notes[:10]
 
@@ -358,6 +511,7 @@ async def get_my_context(step_id: int) -> dict[str, Any]:
         "campaign_goal": campaign.goal,
         "your_task": step.action,
         "your_step_id": step.id,
+        "your_input": input_preview,
         "depth": step.depth,
         "max_depth": campaign.max_depth,
         "upstream_context": upstream,
@@ -368,7 +522,119 @@ async def get_my_context(step_id: int) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@worker_tool()
+async def read_step_output(
+    step_id: int,
+    offset: int = 0,
+    limit: int = 8000,
+    field: str = "output",
+) -> dict[str, Any]:
+    """Read a range from a step's ``output`` (or ``input``) field.
+
+    Counterpart to the preview-plus-seek contract in ``get_my_context``:
+    when an upstream preview is truncated, call this with the
+    ``step_id`` from the preview to pull the full (or a slice of) text.
+
+    Args:
+        step_id: The step whose output you want to read. Does not have
+            to be your own step — any step in the same campaign's DAG
+            is readable.
+        offset: 0-indexed character offset to start from.
+        limit: Max characters to return (default 8000, capped at 32000
+            to avoid blowing the agent's context).
+        field: ``"output"`` (default) or ``"input"``.
+
+    Returns::
+
+        {
+            "step_id": N,
+            "field": "output",
+            "content": "...",
+            "offset": 0,
+            "limit": 8000,
+            "total_chars": N,
+            "has_more": bool,  # True if offset+limit < total_chars
+        }
+    """
+    if field not in ("output", "input"):
+        return {"error": f"field must be 'output' or 'input', got {field!r}"}
+    limit = max(1, min(limit, 32_000))
+    offset = max(0, offset)
+
+    db = await get_db()
+    step = await db.get_step(step_id)
+    if not step:
+        return {"error": f"Step {step_id} not found"}
+
+    text = step.output if field == "output" else step.input
+    if text is None:
+        return {
+            "step_id": step_id,
+            "field": field,
+            "content": "",
+            "offset": 0,
+            "limit": limit,
+            "total_chars": 0,
+            "has_more": False,
+        }
+    total = len(text)
+    slice_end = min(offset + limit, total)
+    return {
+        "step_id": step_id,
+        "field": field,
+        "content": text[offset:slice_end],
+        "offset": offset,
+        "limit": limit,
+        "total_chars": total,
+        "has_more": slice_end < total,
+    }
+
+
+@worker_tool()
+async def heartbeat(
+    step_id: int | None = None,
+    extend_leases_sec: int = 900,
+) -> dict[str, Any]:
+    """Report that you're still alive and keep your claim + leases fresh.
+
+    Long-running agents should call this every few minutes. The runner's
+    ``reset_zombies`` sweep uses ``heartbeat_at`` to distinguish healthy
+    workers from crashed ones. If you hold resource leases (see
+    ``requires_locks`` on your step), the lease ``expires_at`` is bumped
+    by ``extend_leases_sec`` from now so the lease reaper won't steal
+    them out from under you.
+
+    Returns ``{"status": "stale_claim"}`` if your claim token no longer
+    matches — this means the zombie reset already repossessed your step.
+    **Stop working immediately** if you see that: another runner is
+    about to pick your step up.
+
+    Args:
+        step_id: Your step ID. Inferred from ``$SORTIE_STEP_ID`` if unset.
+        extend_leases_sec: Seconds of TTL to give every lease you hold.
+            Default 900 (15 min). Set to 0 for heartbeat-only.
+
+    Returns: ``{"status": "ok" | "stale_claim", "step_id": N}``.
+    """
+    resolved = resolve_step_id(step_id)
+    if resolved is None:
+        return {
+            "error": "step_id not provided and $SORTIE_STEP_ID is unset",
+        }
+    token = session_claim_token()
+    if token is None:
+        return {
+            "error": "heartbeat requires $SORTIE_CLAIM_TOKEN to be set by the runner",
+        }
+    db = await get_db()
+    extend = extend_leases_sec if extend_leases_sec > 0 else None
+    step = await db.heartbeat(resolved, token, extend_leases_sec=extend)
+    if step is None:
+        return {"status": "stale_claim", "step_id": resolved}
+    return {"status": "ok", "step_id": step.id}
+
+
+@worker_tool()
 async def add_note(
     campaign_id: str,
     content: str,
@@ -397,7 +663,7 @@ async def add_note(
     }
 
 
-@mcp.tool()
+@worker_tool()
 async def search_notes(
     query: str,
     campaign_id: str | None = None,
@@ -425,7 +691,7 @@ async def search_notes(
     ]
 
 
-@mcp.tool()
+@worker_tool()
 async def get_notes(
     campaign_id: str,
     tags: list[str] | None = None,
@@ -448,22 +714,39 @@ async def get_notes(
     ]
 
 
-@mcp.tool()
-async def complete_step(step_id: int, summary: str) -> dict[str, Any]:
+@worker_tool()
+async def complete_step(
+    step_id: int | None = None,
+    summary: str = "",
+) -> dict[str, Any]:
     """Mark your step as done with a summary of what you accomplished.
 
     Args:
-        step_id: Your step ID.
-        summary: What you did and what you found. This becomes the step output
-                 visible to downstream steps.
+        step_id: Your step ID. Inferred from ``$SORTIE_STEP_ID`` if unset.
+        summary: What you did and what you found. This becomes the step
+                 output visible to downstream steps.
 
     Returns: Confirmation. If the step was already skipped (branch abort),
-             returns {status: "skipped"} — your output is recorded for audit.
+             returns ``{status: "skipped"}`` — your output is recorded for audit.
+             Returns ``{status: "stale_claim"}`` if a zombie-reset already
+             stole your claim — stop working.
     """
+    resolved = resolve_step_id(step_id)
+    if resolved is None:
+        return {
+            "error": "step_id not provided and $SORTIE_STEP_ID is unset",
+        }
     db = await get_db()
-    step = await db.complete_step(step_id, summary)
+    # Session claim_token enforces: "only the owner of this claim may
+    # complete it". A zombie worker whose claim was reset sees ``None``.
+    step = await db.complete_step(resolved, summary, claim_token=session_claim_token())
     if not step:
-        return {"error": f"Step {step_id} not found"}
+        # Distinguish "token mismatch" from "step missing". When a session
+        # token was set but the update failed, it's almost certainly a
+        # stale claim.
+        if session_claim_token() is not None:
+            return {"status": "stale_claim", "step_id": resolved}
+        return {"error": f"Step {resolved} not found"}
 
     if step.status == StepStatus.SKIPPED:
         return {
@@ -472,23 +755,33 @@ async def complete_step(step_id: int, summary: str) -> dict[str, Any]:
             "output_recorded": True,
         }
 
-    return {"status": "done", "step_id": step_id}
+    return {"status": "done", "step_id": resolved}
 
 
-@mcp.tool()
-async def fail_step(step_id: int, error: str) -> dict[str, Any]:
+@worker_tool()
+async def fail_step(
+    step_id: int | None = None,
+    error: str = "",
+) -> dict[str, Any]:
     """Report that you cannot complete your step.
 
     Args:
-        step_id: Your step ID.
+        step_id: Your step ID. Inferred from ``$SORTIE_STEP_ID`` if unset.
         error: What went wrong and why you can't continue.
 
     Returns: Whether the step can be retried or has failed permanently.
     """
+    resolved = resolve_step_id(step_id)
+    if resolved is None:
+        return {
+            "error": "step_id not provided and $SORTIE_STEP_ID is unset",
+        }
     db = await get_db()
-    step = await db.fail_step(step_id, error)
+    step = await db.fail_step(resolved, error, claim_token=session_claim_token())
     if not step:
-        return {"error": f"Step {step_id} not found"}
+        if session_claim_token() is not None:
+            return {"status": "stale_claim", "step_id": resolved}
+        return {"error": f"Step {resolved} not found"}
 
     return {
         "status": step.status.value,
@@ -498,7 +791,54 @@ async def fail_step(step_id: int, error: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@worker_tool()
+async def request_input(
+    step_id: int | None = None,
+    question: str = "",
+    partial_output: str | None = None,
+) -> dict[str, Any]:
+    """Pause your step and ask the coordinator for a decision.
+
+    Use when you hit a fork that requires human judgement — e.g. which
+    approach to take, whether to proceed with a risky action, or
+    clarification on ambiguous requirements.
+
+    Your step pauses until the coordinator calls ``provide_input``.
+    When it resumes, the answer will be in your step's input field
+    (visible via ``get_my_context``).
+
+    Args:
+        step_id: Your step ID. Inferred from ``$SORTIE_STEP_ID`` if unset.
+        question: What you need decided. Be specific.
+        partial_output: Optional summary of work done so far.
+
+    Returns: Confirmation that the step is paused.
+    """
+    resolved = resolve_step_id(step_id)
+    if resolved is None:
+        return {
+            "error": "step_id not provided and $SORTIE_STEP_ID is unset",
+        }
+    db = await get_db()
+    step = await db.request_input(
+        resolved,
+        question,
+        partial_output=partial_output,
+        claim_token=session_claim_token(),
+    )
+    if not step:
+        if session_claim_token() is not None:
+            return {"status": "stale_claim", "step_id": resolved}
+        return {"error": f"Step {resolved} not found or not in running status"}
+    return {
+        "status": "waiting_input",
+        "step_id": step.id,
+        "question": question,
+        "message": "Step paused. The coordinator will provide input and your step will be re-dispatched.",
+    }
+
+
+@worker_tool()
 async def spawn_and_continue(
     step_id: int,
     partial_output: str,
@@ -533,7 +873,7 @@ async def spawn_and_continue(
     }
 
 
-@mcp.tool()
+@worker_tool()
 async def abort_branch(
     target_id: int,
     output: str,

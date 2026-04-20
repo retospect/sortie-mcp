@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from .db import DB
+from .locks import default_owner
 from .models import (
     PRIORITY_ORDER,
     Campaign,
@@ -57,21 +58,32 @@ PLANNER_MODEL = os.environ.get("SORTIE_PLANNER_MODEL", "qwen3.5:9b")
 class Runner:
     """Campaign runner — capacity-aware watchdog."""
 
-    def __init__(self, db: DB) -> None:
+    def __init__(self, db: DB, *, owner: str | None = None) -> None:
         self.db = db
         self.http = httpx.AsyncClient(timeout=300)
+        # Stable owner identity used for every claim this process issues.
+        # Defaults to ``<host>/runner-pid-<pid>`` (see :mod:`sortie_mcp.locks`).
+        self.owner = owner or default_owner()
 
     async def close(self) -> None:
         await self.http.aclose()
 
     async def tick(self) -> None:
         """One cron tick. Called every 15 minutes."""
-        log.info("Runner tick starting")
+        log.info("Runner tick starting (owner=%s)", self.owner)
 
-        # 1. Reset zombies
+        # 1a. Reset zombie steps (also drops their leases — see DB.reset_zombies).
         zombies = await self.db.reset_zombies(ZOMBIE_TIMEOUT_MINUTES)
         if zombies:
             log.info("Reset %d zombie steps", zombies)
+
+        # 1b. Reap any orphan leases whose TTL elapsed without a heartbeat.
+        # This is belt-and-braces: zombie reset already drops leases held
+        # by reset rows, but this catches leases left by crashed runners
+        # whose step rows are no longer ``running``.
+        reaped = await self.db.reap_expired_leases()
+        if reaped:
+            log.info("Reaped %d expired resource leases", reaped)
 
         # 2. Check capacity
         running = await self.db.count_running()
@@ -145,21 +157,40 @@ class Runner:
             ready = await self.db.get_ready_steps(campaign.id)
 
         dispatched = 0
-        for step in ready[:max_slots]:
-            claimed = await self.db.claim_step(step.id)
-            if claimed:
-                log.info(
-                    "Dispatching step %d: %s (agent=%s)",
-                    step.id,
-                    step.action[:80],
-                    step.agent,
+        # Walk further than max_slots so a lock-busy step doesn't waste the
+        # tick — we skip past it and try the next ready step.
+        for step in ready:
+            if dispatched >= max_slots:
+                break
+            if step.requires_locks:
+                claimed = await self.db.try_claim_with_locks(
+                    step.id, step.requires_locks, owner=self.owner
                 )
-                # Fire-and-forget dispatch to OpenClaw runtime
-                task = asyncio.create_task(self._execute_step(claimed, campaign))
-                task.add_done_callback(
-                    lambda t: t.exception() if not t.cancelled() else None
-                )
-                dispatched += 1
+                if claimed is None:
+                    log.debug(
+                        "Step %d: lock-busy or claim race; skipping (locks=%r)",
+                        step.id,
+                        step.requires_locks,
+                    )
+                    continue
+            else:
+                claimed = await self.db.claim_step(step.id, owner=self.owner)
+                if claimed is None:
+                    continue
+
+            log.info(
+                "Dispatching step %d: %s (agent=%s, owner=%s)",
+                step.id,
+                step.action[:80],
+                step.agent,
+                self.owner,
+            )
+            # Fire-and-forget dispatch to OpenClaw runtime
+            task = asyncio.create_task(self._execute_step(claimed, campaign))
+            task.add_done_callback(
+                lambda t: t.exception() if not t.cancelled() else None
+            )
+            dispatched += 1
 
         return dispatched
 
@@ -169,7 +200,10 @@ class Runner:
             # Build context envelope for the agent
             context = await self._build_step_context(step, campaign)
 
-            # Dispatch to OpenClaw runtime
+            # Dispatch to OpenClaw runtime.
+            # ``env`` carries the session bindings expected by sortie_mcp.session:
+            # the agent's MCP server process will read these and thread them into
+            # every tool call so the LLM never has to restate its own identity.
             response = await self.http.post(
                 f"{OPENCLAW_RUNTIME_URL}/api/agent/execute",
                 json={
@@ -178,6 +212,20 @@ class Runner:
                     "step_id": step.id,
                     "campaign_id": str(campaign.id),
                     "tools": self._get_tools_for_depth(step.depth, campaign.max_depth),
+                    "env": {
+                        "SORTIE_ROLE": "worker",
+                        "SORTIE_STEP_ID": str(step.id),
+                        "SORTIE_CAMPAIGN_ID": str(campaign.id),
+                        # Claim token is only set if the step was actually
+                        # claimed through the v0.2 path — earlier rows may
+                        # have no token and the DB falls through to the
+                        # "trusted in-process caller" path.
+                        **(
+                            {"SORTIE_CLAIM_TOKEN": str(step.claim_token)}
+                            if step.claim_token
+                            else {}
+                        ),
+                    },
                 },
             )
 
@@ -220,6 +268,10 @@ class Runner:
             f"- [{', '.join(n.tags)}] {n.content}" for n in notes[:10]
         )
 
+        input_context = ""
+        if step.input:
+            input_context = f"\n### Input provided by coordinator\n{step.input}\n"
+
         depth_warning = ""
         if step.depth >= campaign.max_depth:
             depth_warning = (
@@ -237,7 +289,7 @@ class Runner:
 
 ### Relevant notes from other steps
 {notes_text or "No notes yet."}
-
+{input_context}
 ### Instructions
 1. Do the work using your own tools (perplexity, precis, etc.)
 2. Call add_note(content, tags) when you discover something noteworthy
@@ -270,6 +322,7 @@ class Runner:
             "complete_step",
             "fail_step",
             "abort_branch",
+            "request_input",
         ]
         if depth < max_depth:
             tools.append("spawn_and_continue")

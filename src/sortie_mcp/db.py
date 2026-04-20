@@ -5,12 +5,14 @@ All SQL uses a configurable schema name (default: ``sortie``).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 
+from .locks import KEY_SEP, LockMode
 from .models import (
     Campaign,
     CampaignStatus,
@@ -19,6 +21,7 @@ from .models import (
     Notification,
     NotificationLevel,
     Priority,
+    ResourceLease,
     Step,
     StepStatus,
     StepType,
@@ -27,95 +30,11 @@ from .models import (
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Schema migration
-# ---------------------------------------------------------------------------
 
-SCHEMA_SQL = """
-CREATE SCHEMA IF NOT EXISTS {schema};
-
-CREATE TABLE IF NOT EXISTS {schema}.campaigns (
-    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    name            text,
-    goal            text NOT NULL,
-    status          text NOT NULL DEFAULT 'active',
-    strategy        text,
-    progress        text,
-    channel         text,
-    user_id         text,
-    max_depth       smallint NOT NULL DEFAULT 4,
-    token_budget    integer,
-    tokens_used     integer NOT NULL DEFAULT 0,
-    failure_policy  text NOT NULL DEFAULT 'continue',
-    priority        text NOT NULL DEFAULT 'normal',
-    next_action_at  timestamptz NOT NULL DEFAULT now(),
-    last_reported_at timestamptz,
-    created_at      timestamptz NOT NULL DEFAULT now(),
-    updated_at      timestamptz NOT NULL DEFAULT now(),
-    completed_at    timestamptz
-);
-
-CREATE INDEX IF NOT EXISTS idx_campaigns_due
-    ON {schema}.campaigns (next_action_at)
-    WHERE status = 'active';
-
-CREATE TABLE IF NOT EXISTS {schema}.campaign_steps (
-    id              serial PRIMARY KEY,
-    campaign_id     uuid NOT NULL REFERENCES {schema}.campaigns(id),
-    parent_step_id  integer REFERENCES {schema}.campaign_steps(id),
-    depth           smallint NOT NULL DEFAULT 0,
-    action          text NOT NULL,
-    agent           text,
-    step_type       text NOT NULL DEFAULT 'atomic',
-    status          text NOT NULL DEFAULT 'pending',
-    failure_policy  text NOT NULL DEFAULT 'continue',
-    depends_on      integer[],
-    input           text,
-    output          text,
-    error           text,
-    fingerprint     text,
-    continuation_of integer REFERENCES {schema}.campaign_steps(id),
-    completion_threshold smallint,
-    retry_count     smallint NOT NULL DEFAULT 0,
-    max_retries     smallint NOT NULL DEFAULT 3,
-    tokens_used     integer,
-    duration_ms     integer,
-    created_at      timestamptz NOT NULL DEFAULT now(),
-    started_at      timestamptz,
-    completed_at    timestamptz
-);
-
-CREATE INDEX IF NOT EXISTS idx_steps_campaign_status
-    ON {schema}.campaign_steps (campaign_id, status)
-    WHERE status IN ('pending', 'running');
-
-CREATE INDEX IF NOT EXISTS idx_steps_fingerprint
-    ON {schema}.campaign_steps (fingerprint);
-
-CREATE TABLE IF NOT EXISTS {schema}.campaign_notes (
-    id              serial PRIMARY KEY,
-    campaign_id     uuid NOT NULL REFERENCES {schema}.campaigns(id),
-    step_id         integer REFERENCES {schema}.campaign_steps(id),
-    agent           text,
-    content         text NOT NULL,
-    tags            text[] DEFAULT '{{}}',
-    embedding       vector(384),
-    created_at      timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_notes_campaign
-    ON {schema}.campaign_notes (campaign_id);
-
-CREATE TABLE IF NOT EXISTS {schema}.notifications (
-    id              serial PRIMARY KEY,
-    campaign_id     uuid REFERENCES {schema}.campaigns(id),
-    channel         text NOT NULL,
-    message         text NOT NULL,
-    level           text NOT NULL DEFAULT 'info',
-    delivered       boolean NOT NULL DEFAULT false,
-    created_at      timestamptz NOT NULL DEFAULT now()
-);
-"""
+class _LockConflict(Exception):
+    """Internal sentinel raised inside :meth:`DB._try_claim_with_locks_once`
+    to roll back the SERIALIZABLE transaction when a requested lease
+    conflicts with an existing one. Caller translates to ``None``."""
 
 
 class DB:
@@ -151,17 +70,29 @@ class DB:
         return self._pool
 
     async def migrate(self) -> None:
-        """Create schema and tables if they don't exist."""
+        """Apply any pending migrations via yoyo.
+
+        Safe to call on every startup: yoyo takes an advisory lock and
+        only applies migrations whose ids are not already in the
+        ``_sortie_migrations__<schema>`` tracking table.
+        """
         async with self.pool.acquire() as conn:
-            # pgvector extension (may require superuser; skip gracefully)
+            # pgvector extension (may require superuser; skip gracefully).
+            # The tracking table is schema-public, so this must succeed
+            # before yoyo imports the migration files that reference
+            # ``vector(384)``.
             try:
                 await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             except asyncpg.InsufficientPrivilegeError:
                 log.warning(
                     "Cannot create vector extension — must be created by superuser"
                 )
-            sql = SCHEMA_SQL.format(schema=self.schema)
-            await conn.execute(sql)
+
+        # yoyo is synchronous; run it in a worker thread so we don't
+        # block the event loop during startup.
+        from ._migrate_impl import apply_migrations
+
+        await asyncio.to_thread(apply_migrations, self.dsn, self.schema)
         log.info("Schema migration complete (schema=%s)", self.schema)
 
     # ------------------------------------------------------------------
@@ -219,6 +150,10 @@ class DB:
             created_at=row["created_at"],
             started_at=row["started_at"],
             completed_at=row["completed_at"],
+            claim_owner=row["claim_owner"],
+            claim_token=row["claim_token"],
+            heartbeat_at=row["heartbeat_at"],
+            requires_locks=list(row["requires_locks"] or []),
         )
 
     def _row_to_note(self, row: asyncpg.Record) -> Note:
@@ -241,6 +176,16 @@ class DB:
             level=NotificationLevel(row["level"]),
             delivered=row["delivered"],
             created_at=row["created_at"],
+        )
+
+    def _row_to_lease(self, row: asyncpg.Record) -> ResourceLease:
+        return ResourceLease(
+            resource_key=row["resource_key"],
+            step_id=row["step_id"],
+            owner=row["owner"],
+            mode=row["mode"],
+            acquired_at=row["acquired_at"],
+            expires_at=row["expires_at"],
         )
 
     # ------------------------------------------------------------------
@@ -347,6 +292,7 @@ class DB:
         failure_policy: FailurePolicy = FailurePolicy.CONTINUE,
         continuation_of: int | None = None,
         completion_threshold: int | None = None,
+        requires_locks: list[str] | None = None,
     ) -> Step:
         # Canonical resolution: resolve depends_on through continuation chains
         resolved_deps = await self._resolve_deps(campaign_id, depends_on or [])
@@ -356,8 +302,8 @@ class DB:
             INSERT INTO {self._t("campaign_steps")}
                 (campaign_id, action, agent, step_type, parent_step_id,
                  depth, depends_on, input, failure_policy, fingerprint,
-                 continuation_of, completion_threshold)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 continuation_of, completion_threshold, requires_locks)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING *
             """,
             campaign_id,
@@ -372,6 +318,7 @@ class DB:
             fp,
             continuation_of,
             completion_threshold,
+            requires_locks or None,
         )
         return self._row_to_step(row)
 
@@ -418,18 +365,268 @@ class DB:
         )
         return [self._row_to_step(r) for r in rows]
 
-    async def claim_step(self, step_id: int) -> Step | None:
-        """Atomically claim a pending step for execution."""
+    async def claim_step(self, step_id: int, owner: str | None = None) -> Step | None:
+        """Atomically claim a pending step for execution.
+
+        Stamps ``claim_owner``, a fresh ``claim_token`` (UUID), and
+        ``heartbeat_at = now()``. Subsequent ``complete_step`` /
+        ``fail_step`` / ``request_input`` calls must present this same
+        ``claim_token`` or they receive a ``stale_claim`` no-op
+        (see :data:`sortie_mcp.locks.STALE_CLAIM`).
+
+        ``owner`` defaults to :func:`sortie_mcp.locks.default_owner`
+        (``<host>/runner-pid-<pid>``).
+        """
+        from .locks import default_owner
+
+        owner = owner or default_owner()
+        token = uuid4()
         row = await self.pool.fetchrow(
             f"""
             UPDATE {self._t("campaign_steps")}
-            SET status = 'running', started_at = now()
+            SET status        = 'running',
+                started_at    = now(),
+                heartbeat_at  = now(),
+                claim_owner   = $2,
+                claim_token   = $3
             WHERE id = $1 AND status = 'pending'
             RETURNING *
             """,
             step_id,
+            owner,
+            token,
         )
         return self._row_to_step(row) if row else None
+
+    async def heartbeat(
+        self,
+        step_id: int,
+        claim_token: UUID | str,
+        *,
+        extend_leases_sec: int | None = 900,
+    ) -> Step | None:
+        """Refresh ``heartbeat_at`` to defer zombie reset.
+
+        Also extends the ``expires_at`` of every resource lease held by
+        this step (by ``extend_leases_sec`` from now), so a healthy
+        long-running worker doesn't lose its locks to the reaper.
+        Pass ``extend_leases_sec=None`` to skip lease extension.
+
+        Returns the updated Step on success, or ``None`` if the step is
+        no longer claimed by this token (zombie-reset, completion, etc.
+        — caller should stop working).
+        """
+        token = UUID(claim_token) if isinstance(claim_token, str) else claim_token
+        async with self.pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                f"""
+                UPDATE {self._t("campaign_steps")}
+                SET heartbeat_at = now()
+                WHERE id = $1
+                  AND status = 'running'
+                  AND claim_token = $2
+                RETURNING *
+                """,
+                step_id,
+                token,
+            )
+            if not row:
+                return None
+            if extend_leases_sec is not None:
+                await conn.execute(
+                    f"""
+                    UPDATE {self._t("resource_leases")}
+                    SET expires_at = now() + ($2 || ' seconds')::interval
+                    WHERE step_id = $1
+                    """,
+                    step_id,
+                    str(extend_leases_sec),
+                )
+            return self._row_to_step(row)
+
+    # ------------------------------------------------------------------
+    # Resource leases (migration 0003)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_lock_keys(
+        keys: list[str] | list[tuple[str, LockMode | str]],
+        default_mode: LockMode,
+    ) -> list[tuple[str, str]]:
+        """Coerce a mixed input into a ``[(key, mode_str), ...]`` list."""
+        out: list[tuple[str, str]] = []
+        for item in keys:
+            if isinstance(item, tuple):
+                key, mode = item
+                mode_str = mode.value if isinstance(mode, LockMode) else str(mode)
+            else:
+                key = item
+                mode_str = default_mode.value
+            if mode_str not in ("exclusive", "shared"):
+                raise ValueError(f"invalid lock mode {mode_str!r} for key {key!r}")
+            out.append((key, mode_str))
+        return out
+
+    async def try_claim_with_locks(
+        self,
+        step_id: int,
+        keys: list[str] | list[tuple[str, LockMode | str]],
+        *,
+        owner: str | None = None,
+        ttl_sec: int = 900,
+        default_mode: LockMode = LockMode.EXCLUSIVE,
+        max_retries: int = 3,
+    ) -> Step | None:
+        """Atomically claim a step *and* acquire all requested resource leases.
+
+        Returns the claimed :class:`~sortie_mcp.models.Step` (with fresh
+        ``claim_token``) on success, or ``None`` if either:
+
+        - the step is no longer ``pending`` (lost the claim race), or
+        - any of ``keys`` conflicts with an existing non-expired lease
+          (hierarchical EXCL/SHARED conflict per :func:`sortie_mcp.locks.lease_conflicts`).
+
+        Under contention the caller should treat ``None`` as "skip and
+        try a different ready step" — leases are revisited on the next
+        runner tick.
+
+        ``keys`` accepts plain strings (all use ``default_mode``) or
+        ``(key, mode)`` tuples for mixed-mode atomic acquire.
+        """
+        from .locks import default_owner as _default_owner
+
+        owner = owner or _default_owner()
+        normalized = self._normalize_lock_keys(keys, default_mode)
+
+        for attempt in range(max_retries):
+            try:
+                return await self._try_claim_with_locks_once(
+                    step_id, normalized, owner, ttl_sec
+                )
+            except _LockConflict:
+                # A requested key conflicts with an existing lease.
+                # Step claim was rolled back by the SERIALIZABLE
+                # transaction, so the row is back to ``pending``.
+                return None
+            except asyncpg.SerializationError:
+                # Two concurrent claimers raced through SERIALIZABLE; back
+                # off briefly and retry. The second claimer will likely
+                # see the first's row on retry and return None cleanly.
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(0.01 * (attempt + 1))
+        return None  # unreachable
+
+    async def _try_claim_with_locks_once(
+        self,
+        step_id: int,
+        normalized_keys: list[tuple[str, str]],
+        owner: str,
+        ttl_sec: int,
+    ) -> Step | None:
+        token = uuid4()
+        async with (
+            self.pool.acquire() as conn,
+            conn.transaction(isolation="serializable"),
+        ):
+            # Stage 1 — claim the step row (only if still pending).
+            row = await conn.fetchrow(
+                f"""
+                    UPDATE {self._t("campaign_steps")}
+                    SET status        = 'running',
+                        started_at    = now(),
+                        heartbeat_at  = now(),
+                        claim_owner   = $2,
+                        claim_token   = $3
+                    WHERE id = $1 AND status = 'pending'
+                    RETURNING *
+                    """,
+                step_id,
+                owner,
+                token,
+            )
+            if not row:
+                return None  # lost the race
+
+            # Stage 2 — check every requested key for hierarchical conflicts.
+            # Build the prefix-conflict predicate per requested key.
+            # Held EXCL conflicts with anything; held SHARED conflicts
+            # only with requested EXCL.
+            for req_key, req_mode in normalized_keys:
+                conflict = await conn.fetchval(
+                    f"""
+                        SELECT 1 FROM {self._t("resource_leases")}
+                        WHERE expires_at > now()
+                          AND step_id <> $1
+                          AND (
+                              resource_key = $2
+                              OR $2 LIKE resource_key || $3 || '%'
+                              OR resource_key LIKE $2 || $3 || '%'
+                          )
+                          AND ($4 = 'exclusive' OR mode = 'exclusive')
+                        LIMIT 1
+                        """,
+                    step_id,
+                    req_key,
+                    KEY_SEP,
+                    req_mode,
+                )
+                if conflict:
+                    # Roll back the claim — caller will see None.
+                    raise _LockConflict()
+
+            # Stage 3 — insert all the leases atomically.
+            if normalized_keys:
+                await conn.executemany(
+                    f"""
+                        INSERT INTO {self._t("resource_leases")}
+                            (resource_key, step_id, owner, mode, expires_at)
+                        VALUES ($1, $2, $3, $4, now() + ($5 || ' seconds')::interval)
+                        ON CONFLICT (resource_key, step_id) DO UPDATE
+                            SET mode = EXCLUDED.mode,
+                                owner = EXCLUDED.owner,
+                                expires_at = EXCLUDED.expires_at
+                        """,
+                    [
+                        (req_key, step_id, owner, req_mode, str(ttl_sec))
+                        for req_key, req_mode in normalized_keys
+                    ],
+                )
+            return self._row_to_step(row)
+
+    async def release_leases(self, step_id: int) -> int:
+        """Drop every lease held by ``step_id``. Returns rows deleted."""
+        result = await self.pool.execute(
+            f"DELETE FROM {self._t('resource_leases')} WHERE step_id = $1",
+            step_id,
+        )
+        return int(result.split()[-1])
+
+    async def get_leases(self, step_id: int) -> list[ResourceLease]:
+        """List all (non-expired) leases held by a step."""
+        rows = await self.pool.fetch(
+            f"""
+            SELECT * FROM {self._t("resource_leases")}
+            WHERE step_id = $1 AND expires_at > now()
+            ORDER BY resource_key
+            """,
+            step_id,
+        )
+        return [self._row_to_lease(r) for r in rows]
+
+    async def reap_expired_leases(self) -> int:
+        """Delete leases whose ``expires_at`` is in the past.
+
+        The runner calls this each tick alongside :meth:`reset_zombies`.
+        Healthy workers extend their leases via :meth:`heartbeat`.
+        """
+        result = await self.pool.execute(
+            f"DELETE FROM {self._t('resource_leases')} WHERE expires_at <= now()"
+        )
+        count = int(result.split()[-1])
+        if count:
+            log.info("Reaped %d expired resource leases", count)
+        return count
 
     async def complete_step(
         self,
@@ -438,8 +635,17 @@ class DB:
         *,
         tokens_used: int | None = None,
         duration_ms: int | None = None,
+        claim_token: UUID | str | None = None,
     ) -> Step | None:
-        """Mark a step as done. Returns None if step was already skipped."""
+        """Mark a step as done. Returns None if step was already skipped.
+
+        If ``claim_token`` is provided, the update is gated on token match;
+        a mismatch returns ``None`` (caller should treat as ``stale_claim``).
+        ``claim_token=None`` preserves pre-0.2 behaviour for trusted
+        in-process callers (e.g. the runner's auto-complete from runtime
+        responses).
+        """
+        token = UUID(claim_token) if isinstance(claim_token, str) else claim_token
         row = await self.pool.fetchrow(
             f"""
             UPDATE {self._t("campaign_steps")}
@@ -449,16 +655,20 @@ class DB:
                 duration_ms = $4,
                 completed_at = now()
             WHERE id = $1
+              AND ($5::uuid IS NULL OR claim_token = $5::uuid)
             RETURNING *
             """,
             step_id,
             output,
             tokens_used,
             duration_ms,
+            token,
         )
         if not row:
             return None
         step = self._row_to_step(row)
+        # Release any held resource leases — work is done.
+        await self.release_leases(step_id)
         # If the step was already skipped (branch abort while running),
         # return it so the caller can see the status
         if step.status == StepStatus.SKIPPED:
@@ -475,9 +685,20 @@ class DB:
             )
         return step
 
-    async def fail_step(self, step_id: int, error: str) -> Step | None:
+    async def fail_step(
+        self,
+        step_id: int,
+        error: str,
+        *,
+        claim_token: UUID | str | None = None,
+    ) -> Step | None:
         """Increment retry count and record error. If max retries exceeded,
-        mark as failed and optionally cascade via fail_fast."""
+        mark as failed and optionally cascade via fail_fast.
+
+        ``claim_token`` semantics match :meth:`complete_step` — when set,
+        a mismatched token returns ``None`` (stale claim).
+        """
+        token = UUID(claim_token) if isinstance(claim_token, str) else claim_token
         row = await self.pool.fetchrow(
             f"""
             UPDATE {self._t("campaign_steps")}
@@ -490,16 +711,27 @@ class DB:
                 completed_at = CASE
                     WHEN retry_count + 1 >= max_retries THEN now()
                     ELSE NULL
-                END
+                END,
+                -- Clear claim on retry-pending OR final-failed so the
+                -- next claimer gets a clean token slot.
+                claim_owner  = NULL,
+                claim_token  = NULL,
+                heartbeat_at = NULL
             WHERE id = $1
+              AND ($3::uuid IS NULL OR claim_token = $3::uuid)
             RETURNING *
             """,
             step_id,
             error,
+            token,
         )
         if not row:
             return None
         step = self._row_to_step(row)
+        # Release any held resource leases — whether retrying or final-failed,
+        # the leases must be dropped so other work / the next attempt can
+        # re-acquire them.
+        await self.release_leases(step_id)
         if (
             step.status == StepStatus.FAILED
             and step.failure_policy == FailurePolicy.FAIL_FAST
@@ -507,21 +739,114 @@ class DB:
             await self._cascade_fail_fast(step)
         return step
 
-    async def reset_zombies(self, timeout_minutes: int = 30) -> int:
-        """Reset steps stuck in 'running' past timeout back to 'pending'."""
-        result = await self.pool.execute(
+    async def request_input(
+        self,
+        step_id: int,
+        question: str,
+        *,
+        partial_output: str | None = None,
+        claim_token: UUID | str | None = None,
+    ) -> Step | None:
+        """Mark a running step as waiting for human/coordinator input.
+
+        The agent calls this when it cannot proceed without a decision.
+        The question is stored in ``output`` (alongside any partial work)
+        and the step pauses until ``provide_input`` resumes it.
+
+        ``claim_token`` semantics match :meth:`complete_step`.
+        """
+        combined = question
+        if partial_output:
+            combined = f"{partial_output}\n\n[WAITING FOR INPUT]: {question}"
+        token = UUID(claim_token) if isinstance(claim_token, str) else claim_token
+        row = await self.pool.fetchrow(
             f"""
             UPDATE {self._t("campaign_steps")}
-            SET status = 'pending', started_at = NULL
-            WHERE status = 'running'
-              AND started_at < now() - ($1 || ' minutes')::interval
+            SET status = 'waiting_input',
+                output = $2
+            WHERE id = $1
+              AND status = 'running'
+              AND ($3::uuid IS NULL OR claim_token = $3::uuid)
+            RETURNING *
             """,
-            str(timeout_minutes),
+            step_id,
+            combined,
+            token,
         )
-        count = int(result.split()[-1])
-        if count:
-            log.info("Reset %d zombie steps (timeout=%dm)", count, timeout_minutes)
-        return count
+        if not row:
+            return None
+        # Step is paused — release leases so unrelated work can proceed.
+        # ``provide_input`` will return the step to ``pending`` and the
+        # next claimer must re-acquire its leases.
+        await self.release_leases(step_id)
+        return self._row_to_step(row)
+
+    async def provide_input(
+        self,
+        step_id: int,
+        answer: str,
+    ) -> Step | None:
+        """Provide input to a waiting step, returning it to pending for re-dispatch.
+
+        The answer is stored in ``input`` so the agent sees it on the next run.
+        Claim metadata is cleared so the step can be re-claimed by any runner.
+        """
+        row = await self.pool.fetchrow(
+            f"""
+            UPDATE {self._t("campaign_steps")}
+            SET status       = 'pending',
+                input        = $2,
+                started_at   = NULL,
+                heartbeat_at = NULL,
+                claim_owner  = NULL,
+                claim_token  = NULL
+            WHERE id = $1 AND status = 'waiting_input'
+            RETURNING *
+            """,
+            step_id,
+            answer,
+        )
+        return self._row_to_step(row) if row else None
+
+    async def reset_zombies(self, timeout_minutes: int = 30) -> int:
+        """Reset steps stuck in 'running' past timeout back to 'pending'.
+
+        Staleness is measured by ``heartbeat_at`` (kept fresh by
+        long-running but healthy steps via :meth:`heartbeat`), falling
+        back to ``started_at`` for legacy rows that pre-date migration
+        0002. Clears claim metadata so the step can be re-claimed and
+        invalidates the previous owner's token.
+
+        Does NOT reset ``waiting_input`` steps — those are legitimately paused.
+        """
+        async with self.pool.acquire() as conn, conn.transaction():
+            # Reset rows and capture their IDs so we can drop the
+            # corresponding leases in the same transaction.
+            rows = await conn.fetch(
+                f"""
+                UPDATE {self._t("campaign_steps")}
+                SET status       = 'pending',
+                    started_at   = NULL,
+                    heartbeat_at = NULL,
+                    claim_owner  = NULL,
+                    claim_token  = NULL
+                WHERE status = 'running'
+                  AND COALESCE(heartbeat_at, started_at)
+                      < now() - ($1 || ' minutes')::interval
+                RETURNING id
+                """,
+                str(timeout_minutes),
+            )
+            count = len(rows)
+            if count:
+                step_ids = [r["id"] for r in rows]
+                await conn.execute(
+                    f"DELETE FROM {self._t('resource_leases')} "
+                    f"WHERE step_id = ANY($1::int[])",
+                    step_ids,
+                )
+                log.info("Reset %d zombie steps (timeout=%dm)", count, timeout_minutes)
+            return count
 
     async def count_running(self) -> int:
         """Count all currently running steps across all campaigns."""
@@ -722,7 +1047,7 @@ class DB:
                     )
                     UPDATE {self._t("campaign_steps")}
                     SET status = 'skipped',
-                        error = 'Dependency skipped (cascade from step ' || $3 || ')'
+                        error = 'Dependency skipped (cascade from step ' || $3::text || ')'
                     WHERE id IN (SELECT id FROM cascade)
                       AND status = 'pending'
                       AND id != ALL($1::int[])
@@ -730,7 +1055,7 @@ class DB:
                     """,
                     skipped_ids,
                     step.campaign_id,
-                    step_id,
+                    str(step_id),
                 )
                 skipped_ids.extend(r["id"] for r in cascade_result)
 

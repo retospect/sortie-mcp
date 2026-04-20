@@ -3,90 +3,22 @@
 These tests are integration tests. Run with:
     uv run pytest -m postgres
 
-Automatically creates/drops a ``sortie_test`` database using the local
-``bots`` account (override with DATABASE_URL env var).
+The ``sortie_test`` database is created/dropped once per session by
+``tests/conftest.py``. Override with ``DATABASE_URL`` to point at an
+existing instance.
 """
 
 from __future__ import annotations
 
-import contextlib
 import os
-import subprocess
 
 import pytest
 
-TEST_DB_NAME = "sortie_test"
-DEFAULT_DSN = f"postgresql://bots@localhost/{TEST_DB_NAME}"
-PG_USER = "bots"
-
-
-def _pg_is_reachable() -> bool:
-    """Quick check: can we reach local PG or the one in DATABASE_URL?"""
-    import importlib.util
-
-    return importlib.util.find_spec("asyncpg") is not None
-
-
-def _createdb() -> bool:
-    """Create the test database. Returns True if created or already exists."""
-    try:
-        subprocess.run(
-            ["createdb", "-U", PG_USER, TEST_DB_NAME],
-            capture_output=True,
-            check=True,
-        )
-        return True
-    except subprocess.CalledProcessError as e:
-        return b"already exists" in e.stderr
-    except FileNotFoundError:
-        return False
-
-
-def _dropdb() -> None:
-    """Drop the test database, ignoring errors."""
-    with contextlib.suppress(FileNotFoundError):
-        subprocess.run(
-            ["dropdb", "-U", PG_USER, "--if-exists", TEST_DB_NAME],
-            capture_output=True,
-            check=False,
-        )
-
-
-# Skip the whole module if we can't reach PG
-_has_db = os.environ.get("DATABASE_URL") or _createdb()
-if _has_db and not os.environ.get("DATABASE_URL"):
-    _dropdb()  # clean up probe; real create happens in fixture
-
-pytestmark = pytest.mark.skipif(
-    not _has_db,
-    reason="PostgreSQL not reachable — skipping DB integration tests",
-)
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _test_database():
-    """Session fixture: createdb before tests, dropdb after."""
-    _createdb()
-    # Install pgvector extension
-    subprocess.run(
-        [
-            "psql",
-            "-U",
-            PG_USER,
-            "-d",
-            TEST_DB_NAME,
-            "-c",
-            "CREATE EXTENSION IF NOT EXISTS vector;",
-        ],
-        capture_output=True,
-        check=False,
-    )
-    yield
-    _dropdb()
+from .conftest import DEFAULT_DSN
 
 
 @pytest.fixture
-async def db(_test_database):
+async def db():
     """Per-test fixture: fresh schema via migrate(), torn down after."""
     from sortie_mcp.db import DB
 
@@ -250,10 +182,14 @@ class TestStepCRUD:
         step = await db.add_step(campaign.id, "Step 1", agent="research")
         await db.claim_step(step.id)
 
-        # Simulate old started_at
+        # Simulate stale heartbeat (the new staleness signal as of
+        # migration 0002). Backdate started_at too for completeness.
         async with db.pool.acquire() as conn:
             await conn.execute(
-                f"UPDATE {db._t('campaign_steps')} SET started_at = now() - interval '2 hours' WHERE id = $1",
+                f"UPDATE {db._t('campaign_steps')} "
+                f"SET started_at = now() - interval '2 hours', "
+                f"    heartbeat_at = now() - interval '2 hours' "
+                f"WHERE id = $1",
                 step.id,
             )
 
@@ -323,8 +259,10 @@ class TestAbortBranch:
     async def test_basic_abort(self, db) -> None:
         campaign = await db.create_campaign("Goal")
         # Create a sequence: parent → A → B → C
+        from sortie_mcp.models import StepType
+
         parent = await db.add_step(
-            campaign.id, "Exosome approach", step_type="sequence"
+            campaign.id, "Exosome approach", step_type=StepType.SEQUENCE
         )
         step_a = await db.add_step(
             campaign.id,

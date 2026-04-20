@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
+import pytest
+
 from sortie_mcp.models import (
     Campaign,
     CampaignStatus,
@@ -131,6 +133,7 @@ class TestToolRegistration:
             "pause_campaign",
             "resume_campaign",
             "cancel_campaign",
+            "provide_input",
         ):
             assert tool in names, f"Missing coordinator tool: {tool}"
 
@@ -145,6 +148,9 @@ class TestToolRegistration:
             "fail_step",
             "spawn_and_continue",
             "abort_branch",
+            "request_input",
+            "read_step_output",  # new in v0.2.0 — preview-plus-seek counterpart
+            "heartbeat",  # new in v0.2.0 — keeps claim + leases fresh
         ):
             assert tool in names, f"Missing worker tool: {tool}"
 
@@ -161,8 +167,9 @@ class TestToolRegistration:
 
     def test_total_tool_count(self) -> None:
         names = self._tool_names()
-        # 8 coordinator + 8 worker = 16
-        assert len(names) == 16, f"Expected 16 tools, got {len(names)}: {names}"
+        # 9 coordinator + 11 worker = 20
+        # (worker +2: read_step_output, heartbeat — both new in v0.2.0)
+        assert len(names) == 20, f"Expected 20 tools, got {len(names)}: {names}"
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +352,9 @@ class TestGetMyContext:
         db.get_notes.return_value = []
         with patch("sortie_mcp.server.get_db", return_value=db):
             result = await get_my_context(42)
-        assert any("Found 5 papers" in u["output"] for u in result["upstream_context"])
+        # v0.2.0: upstream outputs are preview-plus-seek — each entry has a
+        # ``preview`` string (short outputs fit whole; long ones are elided).
+        assert any("Found 5 papers" in u["preview"] for u in result["upstream_context"])
 
     async def test_not_found(self) -> None:
         from sortie_mcp.server import get_my_context
@@ -495,3 +504,320 @@ class TestGetNotes:
             result = await get_notes(str(cid), tags=["finding"])
         assert len(result) == 1
         assert result[0]["content"] == "Note A"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.0 additions — preview-plus-seek, read_step_output, heartbeat
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewHelper:
+    def test_short_text_fits_whole(self) -> None:
+        from sortie_mcp.server import _preview
+
+        out = _preview("hello world")
+        assert out["preview"] == "hello world"
+        assert out["total_chars"] == 11
+        assert out["truncated"] is False
+
+    def test_empty_text(self) -> None:
+        from sortie_mcp.server import _preview
+
+        assert _preview(None) == {"preview": "", "total_chars": 0, "truncated": False}
+        assert _preview("") == {"preview": "", "total_chars": 0, "truncated": False}
+
+    def test_long_text_is_elided(self) -> None:
+        from sortie_mcp.server import (
+            PREVIEW_HEAD_CHARS,
+            PREVIEW_TAIL_CHARS,
+            _preview,
+        )
+
+        text = ("A" * PREVIEW_HEAD_CHARS) + ("B" * 1000) + ("C" * PREVIEW_TAIL_CHARS)
+        out = _preview(text)
+        assert out["truncated"] is True
+        assert out["total_chars"] == len(text)
+        assert out["preview"].startswith("A" * 50)  # head preserved
+        assert out["preview"].endswith("C" * 50)  # tail preserved
+        assert "ELIDED 1000 chars" in out["preview"]
+
+
+class TestGetMyContextPreview:
+    async def test_long_upstream_output_is_previewed_with_hint(self) -> None:
+        """Upstream outputs over the head+tail budget must include a
+        ``read_step_output`` hint so the agent can fetch the rest."""
+        from sortie_mcp.server import PREVIEW_HEAD_CHARS, get_my_context
+
+        db = mock_db()
+        cid = uuid4()
+        long_output = "X" * (PREVIEW_HEAD_CHARS + 5000)
+        dep = make_step(campaign_id=cid, id=10, action="Search", output=long_output)
+        step = make_step(campaign_id=cid, id=42, depends_on=[10])
+        campaign = make_campaign(id=cid)
+        db.get_step.side_effect = lambda sid: step if sid == 42 else dep
+        db.get_campaign.return_value = campaign
+        db.get_notes.return_value = []
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await get_my_context(42)
+        (entry,) = result["upstream_context"]
+        assert entry["truncated"] is True
+        assert entry["total_chars"] == len(long_output)
+        assert "read_step_output(10)" in entry["hint"]
+
+    async def test_step_id_inferred_from_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sortie_mcp.server import get_my_context
+
+        db = mock_db()
+        cid = uuid4()
+        step = make_step(campaign_id=cid, id=42, action="Do the thing")
+        db.get_step.return_value = step
+        db.get_campaign.return_value = make_campaign(id=cid)
+        db.get_notes.return_value = []
+        monkeypatch.setenv("SORTIE_STEP_ID", "42")
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await get_my_context()  # no step_id arg!
+        assert result["your_step_id"] == 42
+        db.get_step.assert_awaited_with(42)
+
+    async def test_error_when_no_step_id_and_no_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sortie_mcp.server import get_my_context
+
+        monkeypatch.delenv("SORTIE_STEP_ID", raising=False)
+        db = mock_db()
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await get_my_context()
+        assert "error" in result
+        assert "SORTIE_STEP_ID" in result["error"]
+
+
+class TestReadStepOutput:
+    async def test_reads_full_output(self) -> None:
+        from sortie_mcp.server import read_step_output
+
+        db = mock_db()
+        db.get_step.return_value = make_step(
+            id=10, output="Hello world", campaign_id=uuid4()
+        )
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await read_step_output(10)
+        assert result["content"] == "Hello world"
+        assert result["total_chars"] == 11
+        assert result["has_more"] is False
+
+    async def test_slices_by_offset_and_limit(self) -> None:
+        from sortie_mcp.server import read_step_output
+
+        db = mock_db()
+        text = "abcdefghij"  # 10 chars
+        db.get_step.return_value = make_step(id=10, output=text, campaign_id=uuid4())
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await read_step_output(10, offset=3, limit=4)
+        assert result["content"] == "defg"
+        assert result["offset"] == 3
+        assert result["limit"] == 4
+        assert result["has_more"] is True
+
+    async def test_limit_capped_at_32k(self) -> None:
+        from sortie_mcp.server import read_step_output
+
+        db = mock_db()
+        db.get_step.return_value = make_step(id=10, output="x", campaign_id=uuid4())
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await read_step_output(10, limit=10**9)
+        assert result["limit"] == 32_000
+
+    async def test_negative_offset_clamped(self) -> None:
+        from sortie_mcp.server import read_step_output
+
+        db = mock_db()
+        db.get_step.return_value = make_step(id=10, output="hello", campaign_id=uuid4())
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await read_step_output(10, offset=-5)
+        assert result["offset"] == 0
+        assert result["content"] == "hello"
+
+    async def test_reads_input_field(self) -> None:
+        from sortie_mcp.server import read_step_output
+
+        db = mock_db()
+        db.get_step.return_value = make_step(
+            id=10, input="my input", output=None, campaign_id=uuid4()
+        )
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await read_step_output(10, field="input")
+        assert result["content"] == "my input"
+        assert result["field"] == "input"
+
+    async def test_rejects_unknown_field(self) -> None:
+        from sortie_mcp.server import read_step_output
+
+        db = mock_db()
+        db.get_step.return_value = make_step(id=10, campaign_id=uuid4())
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await read_step_output(10, field="garbage")
+        assert "error" in result
+
+    async def test_step_not_found(self) -> None:
+        from sortie_mcp.server import read_step_output
+
+        db = mock_db()
+        db.get_step.return_value = None
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await read_step_output(999)
+        assert "error" in result
+
+    async def test_null_output(self) -> None:
+        from sortie_mcp.server import read_step_output
+
+        db = mock_db()
+        db.get_step.return_value = make_step(id=10, output=None, campaign_id=uuid4())
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await read_step_output(10)
+        assert result["content"] == ""
+        assert result["total_chars"] == 0
+        assert result["has_more"] is False
+
+
+class TestHeartbeatTool:
+    async def test_requires_claim_token_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sortie_mcp.server import heartbeat
+
+        monkeypatch.delenv("SORTIE_CLAIM_TOKEN", raising=False)
+        db = mock_db()
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await heartbeat(step_id=42)
+        assert "error" in result
+        assert "SORTIE_CLAIM_TOKEN" in result["error"]
+
+    async def test_requires_step_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from sortie_mcp.server import heartbeat
+
+        monkeypatch.delenv("SORTIE_STEP_ID", raising=False)
+        monkeypatch.setenv("SORTIE_CLAIM_TOKEN", str(uuid4()))
+        db = mock_db()
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await heartbeat()
+        assert "error" in result
+        assert "SORTIE_STEP_ID" in result["error"]
+
+    async def test_ok_when_token_matches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from sortie_mcp.server import heartbeat
+
+        tok = uuid4()
+        monkeypatch.setenv("SORTIE_CLAIM_TOKEN", str(tok))
+        monkeypatch.setenv("SORTIE_STEP_ID", "42")
+        db = mock_db()
+        db.heartbeat.return_value = make_step(id=42, status=StepStatus.RUNNING)
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await heartbeat()
+        assert result["status"] == "ok"
+        assert result["step_id"] == 42
+        # Verify we passed the token through, not a synthetic one.
+        args, _kwargs = db.heartbeat.call_args
+        assert args[0] == 42
+        assert args[1] == tok
+
+    async def test_stale_claim(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from sortie_mcp.server import heartbeat
+
+        monkeypatch.setenv("SORTIE_CLAIM_TOKEN", str(uuid4()))
+        db = mock_db()
+        db.heartbeat.return_value = None  # DB rejected — zombie reset happened
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await heartbeat(step_id=42)
+        assert result["status"] == "stale_claim"
+
+    async def test_zero_extend_skips_lease_bump(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sortie_mcp.server import heartbeat
+
+        monkeypatch.setenv("SORTIE_CLAIM_TOKEN", str(uuid4()))
+        db = mock_db()
+        db.heartbeat.return_value = make_step(id=42, status=StepStatus.RUNNING)
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            await heartbeat(step_id=42, extend_leases_sec=0)
+        _, kwargs = db.heartbeat.call_args
+        assert kwargs["extend_leases_sec"] is None
+
+
+class TestClaimTokenEnforcement:
+    """Session claim_token must flow into complete/fail/request_input."""
+
+    async def test_complete_step_passes_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sortie_mcp.server import complete_step
+
+        tok = uuid4()
+        monkeypatch.setenv("SORTIE_CLAIM_TOKEN", str(tok))
+        db = mock_db()
+        db.complete_step.return_value = make_step(status=StepStatus.DONE)
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            await complete_step(42, "done")
+        _, kwargs = db.complete_step.call_args
+        assert kwargs["claim_token"] == tok
+
+    async def test_complete_step_stale_when_token_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sortie_mcp.server import complete_step
+
+        monkeypatch.setenv("SORTIE_CLAIM_TOKEN", str(uuid4()))
+        db = mock_db()
+        db.complete_step.return_value = None  # token didn't match
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await complete_step(42, "done")
+        assert result["status"] == "stale_claim"
+
+    async def test_fail_step_passes_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sortie_mcp.server import fail_step
+
+        tok = uuid4()
+        monkeypatch.setenv("SORTIE_CLAIM_TOKEN", str(tok))
+        db = mock_db()
+        db.fail_step.return_value = make_step(
+            status=StepStatus.PENDING, retry_count=1, max_retries=3
+        )
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            await fail_step(42, "boom")
+        _, kwargs = db.fail_step.call_args
+        assert kwargs["claim_token"] == tok
+
+    async def test_request_input_passes_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sortie_mcp.server import request_input
+
+        tok = uuid4()
+        monkeypatch.setenv("SORTIE_CLAIM_TOKEN", str(tok))
+        db = mock_db()
+        db.request_input.return_value = make_step(status=StepStatus.WAITING_INPUT)
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            await request_input(42, "what now?")
+        _, kwargs = db.request_input.call_args
+        assert kwargs["claim_token"] == tok
+
+    async def test_no_token_means_no_token_enforcement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no session token, the DB is called with claim_token=None
+        (the ``trusted in-process caller`` path) — preserves v0.1 behaviour."""
+        from sortie_mcp.server import complete_step
+
+        monkeypatch.delenv("SORTIE_CLAIM_TOKEN", raising=False)
+        db = mock_db()
+        db.complete_step.return_value = make_step(status=StepStatus.DONE)
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await complete_step(42, "done")
+        _, kwargs = db.complete_step.call_args
+        assert kwargs["claim_token"] is None
+        assert result["status"] == "done"

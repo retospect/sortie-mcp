@@ -208,7 +208,9 @@ class TestDispatchCampaign:
         with patch.object(runner, "_execute_step", new_callable=AsyncMock):
             dispatched = await runner._dispatch_campaign(campaign, 4)
         assert dispatched == 1
-        mock_db.claim_step.assert_awaited_once_with(42)
+        # Owner is the runner's stable identity (default
+        # ``<host>/runner-pid-<pid>``) — assert position + owner kwarg.
+        mock_db.claim_step.assert_awaited_once_with(42, owner=runner.owner)
 
     async def test_consults_planner_when_no_ready_steps(self, runner, mock_db) -> None:
         campaign = make_campaign()
@@ -217,6 +219,98 @@ class TestDispatchCampaign:
         with patch.object(runner, "_consult_planner", new_callable=AsyncMock):
             await runner._dispatch_campaign(campaign, 4)
             runner._consult_planner.assert_awaited_once_with(campaign)
+
+    async def test_uses_try_claim_with_locks_when_step_requires_locks(
+        self, runner, mock_db
+    ) -> None:
+        """Steps with ``requires_locks`` must go through the lock-aware path."""
+        campaign = make_campaign()
+        step = make_step(
+            campaign_id=campaign.id,
+            id=42,
+            requires_locks=["file:ch01.tex", "file:ch01.tex§PLXDX"],
+        )
+        mock_db.get_ready_steps.return_value = [step]
+        claimed = make_step(
+            campaign_id=campaign.id,
+            id=42,
+            status=StepStatus.RUNNING,
+            requires_locks=step.requires_locks,
+        )
+        mock_db.try_claim_with_locks.return_value = claimed
+
+        with patch.object(runner, "_execute_step", new_callable=AsyncMock):
+            dispatched = await runner._dispatch_campaign(campaign, 4)
+        assert dispatched == 1
+        mock_db.try_claim_with_locks.assert_awaited_once_with(
+            42, step.requires_locks, owner=runner.owner
+        )
+        mock_db.claim_step.assert_not_awaited()
+
+    async def test_dispatches_env_bindings_to_runtime(self, runner, mock_db) -> None:
+        """``_execute_step`` must include SORTIE_* session env vars in the
+        runtime payload so the agent's MCP server can infer its identity."""
+        campaign = make_campaign()
+        tok = uuid4()
+        step = make_step(
+            campaign_id=campaign.id,
+            id=42,
+            status=StepStatus.RUNNING,
+            claim_token=tok,
+            claim_owner="r1",
+        )
+        # Simulate the runtime returning nothing interesting.
+        response = MagicMock()
+        response.status_code = 200
+        response.json = MagicMock(return_value={"handled_by_mcp": True})
+        runner.http.post = AsyncMock(return_value=response)
+
+        await runner._execute_step(step, campaign)
+
+        runner.http.post.assert_awaited_once()
+        _, kwargs = runner.http.post.await_args
+        env = kwargs["json"]["env"]
+        assert env["SORTIE_ROLE"] == "worker"
+        assert env["SORTIE_STEP_ID"] == "42"
+        assert env["SORTIE_CAMPAIGN_ID"] == str(campaign.id)
+        assert env["SORTIE_CLAIM_TOKEN"] == str(tok)
+
+    async def test_env_omits_claim_token_when_not_set(self, runner, mock_db) -> None:
+        """Pre-v0.2 steps without a claim_token must not crash dispatch."""
+        campaign = make_campaign()
+        step = make_step(
+            campaign_id=campaign.id, id=42, status=StepStatus.RUNNING
+        )  # no claim_token
+        response = MagicMock()
+        response.status_code = 200
+        response.json = MagicMock(return_value={})
+        runner.http.post = AsyncMock(return_value=response)
+
+        await runner._execute_step(step, campaign)
+
+        _, kwargs = runner.http.post.await_args
+        env = kwargs["json"]["env"]
+        assert "SORTIE_CLAIM_TOKEN" not in env
+        assert env["SORTIE_STEP_ID"] == "42"
+
+    async def test_lock_busy_step_falls_through_to_next(self, runner, mock_db) -> None:
+        """A ``None`` from ``try_claim_with_locks`` must not waste the slot."""
+        campaign = make_campaign()
+        busy = make_step(campaign_id=campaign.id, id=1, requires_locks=["file:hot.tex"])
+        free = make_step(campaign_id=campaign.id, id=2)
+        mock_db.get_ready_steps.return_value = [busy, free]
+        # First step is lock-busy
+        mock_db.try_claim_with_locks.return_value = None
+        # Second step succeeds via normal claim
+        mock_db.claim_step.return_value = make_step(
+            campaign_id=campaign.id, id=2, status=StepStatus.RUNNING
+        )
+
+        with patch.object(runner, "_execute_step", new_callable=AsyncMock):
+            dispatched = await runner._dispatch_campaign(campaign, 1)
+        assert dispatched == 1
+        mock_db.try_claim_with_locks.assert_awaited_once()
+        mock_db.claim_step.assert_awaited_once_with(2, owner=runner.owner)
 
     async def test_respects_max_slots(self, runner, mock_db) -> None:
         campaign = make_campaign()

@@ -28,6 +28,7 @@ class StepStatus(StrEnum):
     DONE = "done"
     FAILED = "failed"
     SKIPPED = "skipped"
+    WAITING_INPUT = "waiting_input"
 
 
 class StepType(StrEnum):
@@ -119,6 +120,11 @@ class Step:
     created_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    # Multi-runner claim ownership (added in migration 0002)
+    claim_owner: str | None = None
+    claim_token: UUID | None = None
+    heartbeat_at: datetime | None = None
+    requires_locks: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -142,6 +148,18 @@ class Notification:
     level: NotificationLevel = NotificationLevel.INFO
     delivered: bool = False
     created_at: datetime | None = None
+
+
+@dataclass
+class ResourceLease:
+    """A held lease on a hierarchical resource key. See migration 0003."""
+
+    resource_key: str
+    step_id: int
+    owner: str
+    mode: str  # ``exclusive`` | ``shared`` — see :class:`sortie_mcp.locks.LockMode`
+    acquired_at: datetime
+    expires_at: datetime
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +188,8 @@ class StepPlan:
     # sequence / parallel_group children
     steps: list[StepPlan] | None = None
     children: list[StepPlan] | None = None
+    # Resource leases (migration 0002 column, enforced by migration 0003 table)
+    requires_locks: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

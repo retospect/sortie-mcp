@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
+import subprocess
+
 import pytest
 
 from sortie_mcp.models import (
@@ -10,6 +14,72 @@ from sortie_mcp.models import (
     StepPlan,
     StepType,
 )
+
+# ---------------------------------------------------------------------------
+# Shared PostgreSQL test database — used by every test file that needs a
+# real DB connection (test_db.py, test_claim.py, scenario suites that
+# don't provide their own DSN).
+# ---------------------------------------------------------------------------
+
+TEST_DB_NAME = "sortie_test"
+PG_USER = "bots"
+DEFAULT_DSN = f"postgresql://{PG_USER}@localhost/{TEST_DB_NAME}"
+
+
+def _createdb() -> bool:
+    """Create the test database. Returns True if created or already exists."""
+    try:
+        subprocess.run(
+            ["createdb", "-U", PG_USER, TEST_DB_NAME],
+            capture_output=True,
+            check=True,
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        return b"already exists" in e.stderr
+    except FileNotFoundError:
+        return False
+
+
+def _dropdb() -> None:
+    """Drop the test database, ignoring errors."""
+    with contextlib.suppress(FileNotFoundError):
+        subprocess.run(
+            ["dropdb", "-U", PG_USER, "--if-exists", TEST_DB_NAME],
+            capture_output=True,
+            check=False,
+        )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _shared_test_database():
+    """Create ``sortie_test`` once per session, install pgvector, drop on exit.
+
+    Tests opt into using it by depending on ``DATABASE_URL`` (default
+    ``DEFAULT_DSN``) and constructing their own ``DB(dsn, schema=...)``
+    with a unique schema name.
+    """
+    # Honour an externally-provided DATABASE_URL (CI or shared test DB).
+    if os.environ.get("DATABASE_URL"):
+        yield
+        return
+    if not _createdb():
+        pytest.skip("PostgreSQL not reachable — skipping DB integration tests")
+    subprocess.run(
+        [
+            "psql",
+            "-U",
+            PG_USER,
+            "-d",
+            TEST_DB_NAME,
+            "-c",
+            "CREATE EXTENSION IF NOT EXISTS vector;",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    yield
+    _dropdb()
 
 
 @pytest.fixture

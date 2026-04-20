@@ -34,6 +34,7 @@ from uuid import UUID
 from mcp.server.fastmcp import FastMCP
 
 from .db import DB
+from .embeddings import embed_text, embeddings_enabled
 from .models import (
     Campaign,
     CampaignStatus,
@@ -655,11 +656,14 @@ async def add_note(
     """
     db = await get_db()
     cid = UUID(campaign_id)
-    # TODO: generate embedding via LiteLLM embedding endpoint
-    note = await db.add_note(cid, content, tags=tags)
+    # Feature-flagged: if $SORTIE_EMBEDDINGS_ENABLED is off, embed_text
+    # returns None and the note gets a NULL embedding (back-compat).
+    vec = await embed_text(content)
+    note = await db.add_note(cid, content, tags=tags, embedding=vec)
     return {
         "note_id": note.id,
         "recorded": True,
+        "embedded": vec is not None,
     }
 
 
@@ -676,17 +680,43 @@ async def search_notes(
         campaign_id: Scope to a specific campaign. Omit for all.
         top_k: Number of results (default 5).
 
-    Returns: Ranked results with content and tags.
+    Returns: Ranked results with content and tags. Each entry is
+        annotated with ``"mode": "semantic"`` when cosine ranking was
+        used, or ``"mode": "recency"`` when embeddings were disabled /
+        unavailable and the server fell back to most-recent-first
+        listing.
     """
-    # TODO: generate query embedding via LiteLLM embedding endpoint
-    # For now, return notes by recency as fallback
     db = await get_db()
-    if campaign_id:
-        notes = await db.get_notes(UUID(campaign_id))
-    else:
-        notes = []
+    cid = UUID(campaign_id) if campaign_id else None
+
+    # Try the semantic path only when embeddings are on AND LiteLLM
+    # gave us a non-None query vector. Otherwise fall back to recency.
+    query_vec = await embed_text(query) if embeddings_enabled() else None
+    if query_vec is not None:
+        notes = await db.search_notes(query_vec, campaign_id=cid, top_k=top_k)
+        return [
+            {
+                "id": n.id,
+                "content": n.content,
+                "tags": n.tags,
+                "agent": n.agent,
+                "mode": "semantic",
+            }
+            for n in notes
+        ]
+
+    # Fallback: recency-ordered listing. Scoped to campaign when given;
+    # global searches return an empty list rather than silently scanning
+    # every campaign (would be a DoS vector in a large cluster).
+    notes = await db.get_notes(cid) if cid else []
     return [
-        {"id": n.id, "content": n.content, "tags": n.tags, "agent": n.agent}
+        {
+            "id": n.id,
+            "content": n.content,
+            "tags": n.tags,
+            "agent": n.agent,
+            "mode": "recency",
+        }
         for n in notes[:top_k]
     ]
 

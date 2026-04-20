@@ -479,9 +479,12 @@ class TestAbortBranch:
 
 
 class TestAddNote:
-    async def test_creates_note(self) -> None:
+    async def test_creates_note_without_embedding_when_flag_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from sortie_mcp.server import add_note
 
+        monkeypatch.delenv("SORTIE_EMBEDDINGS_ENABLED", raising=False)
         db = mock_db()
         cid = uuid4()
         db.add_note.return_value = make_note(campaign_id=cid, id=7)
@@ -489,6 +492,137 @@ class TestAddNote:
             result = await add_note(str(cid), "Important finding", tags=["finding"])
         assert result["note_id"] == 7
         assert result["recorded"] is True
+        assert result["embedded"] is False
+        # embedding=None should be passed through so the pgvector column is NULL.
+        _, kwargs = db.add_note.call_args
+        assert kwargs["embedding"] is None
+
+    async def test_creates_note_with_embedding_when_flag_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When embeddings are enabled, add_note must ask embed_text for a
+        vector and forward it to the DB insert."""
+        from sortie_mcp.server import add_note
+
+        monkeypatch.setenv("SORTIE_EMBEDDINGS_ENABLED", "1")
+        db = mock_db()
+        cid = uuid4()
+        db.add_note.return_value = make_note(campaign_id=cid, id=7)
+        vec = [0.1] * 384
+        with (
+            patch("sortie_mcp.server.get_db", return_value=db),
+            patch(
+                "sortie_mcp.server.embed_text",
+                new=AsyncMock(return_value=vec),
+            ) as mock_embed,
+        ):
+            result = await add_note(str(cid), "Important finding")
+        assert result["embedded"] is True
+        mock_embed.assert_awaited_once_with("Important finding")
+        _, kwargs = db.add_note.call_args
+        assert kwargs["embedding"] == vec
+
+    async def test_still_records_when_embedding_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fail-open contract: a LiteLLM outage must not stop notes from
+        being saved. The DB insert goes through with ``embedding=None``."""
+        from sortie_mcp.server import add_note
+
+        monkeypatch.setenv("SORTIE_EMBEDDINGS_ENABLED", "1")
+        db = mock_db()
+        db.add_note.return_value = make_note(id=7, campaign_id=uuid4())
+        with (
+            patch("sortie_mcp.server.get_db", return_value=db),
+            patch(
+                "sortie_mcp.server.embed_text",
+                new=AsyncMock(return_value=None),  # LiteLLM bounced
+            ),
+        ):
+            result = await add_note(str(uuid4()), "Finding")
+        assert result["recorded"] is True
+        assert result["embedded"] is False
+
+
+class TestSearchNotes:
+    async def test_semantic_mode_when_flag_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sortie_mcp.server import search_notes
+
+        monkeypatch.setenv("SORTIE_EMBEDDINGS_ENABLED", "1")
+        db = mock_db()
+        cid = uuid4()
+        db.search_notes.return_value = [
+            make_note(campaign_id=cid, id=1, content="top hit", tags=["a"]),
+        ]
+        vec = [0.2] * 384
+        with (
+            patch("sortie_mcp.server.get_db", return_value=db),
+            patch(
+                "sortie_mcp.server.embed_text", new=AsyncMock(return_value=vec)
+            ),
+        ):
+            result = await search_notes("my query", campaign_id=str(cid), top_k=3)
+        assert len(result) == 1
+        assert result[0]["content"] == "top hit"
+        assert result[0]["mode"] == "semantic"
+        db.search_notes.assert_awaited_once_with(vec, campaign_id=cid, top_k=3)
+
+    async def test_recency_fallback_when_flag_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sortie_mcp.server import search_notes
+
+        monkeypatch.delenv("SORTIE_EMBEDDINGS_ENABLED", raising=False)
+        db = mock_db()
+        cid = uuid4()
+        db.get_notes.return_value = [
+            make_note(campaign_id=cid, id=i, content=f"note {i}") for i in range(10)
+        ]
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await search_notes("query", campaign_id=str(cid), top_k=3)
+        assert len(result) == 3
+        assert all(r["mode"] == "recency" for r in result)
+        # Must NOT have gone through the semantic path.
+        db.search_notes.assert_not_awaited()
+
+    async def test_recency_fallback_when_embed_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Even with the flag on, if LiteLLM fails the query embedding we
+        degrade gracefully to recency listing rather than returning []."""
+        from sortie_mcp.server import search_notes
+
+        monkeypatch.setenv("SORTIE_EMBEDDINGS_ENABLED", "1")
+        db = mock_db()
+        cid = uuid4()
+        db.get_notes.return_value = [make_note(campaign_id=cid, id=1)]
+        with (
+            patch("sortie_mcp.server.get_db", return_value=db),
+            patch(
+                "sortie_mcp.server.embed_text", new=AsyncMock(return_value=None)
+            ),
+        ):
+            result = await search_notes("query", campaign_id=str(cid))
+        assert len(result) == 1
+        assert result[0]["mode"] == "recency"
+        db.search_notes.assert_not_awaited()
+
+    async def test_global_recency_search_returns_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unscoped recency search must NOT scan every campaign — too
+        expensive in a cluster. It returns empty and forces the agent to
+        pick a campaign."""
+        from sortie_mcp.server import search_notes
+
+        monkeypatch.delenv("SORTIE_EMBEDDINGS_ENABLED", raising=False)
+        db = mock_db()
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await search_notes("query")  # no campaign_id
+        assert result == []
+        db.get_notes.assert_not_awaited()
 
 
 class TestGetNotes:

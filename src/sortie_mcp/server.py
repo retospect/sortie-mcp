@@ -171,6 +171,13 @@ async def create_campaign(
     max_depth: int = 4,
     token_budget: int | None = None,
     dry_run: bool = False,
+    # Typed success contract (v0.3 B4). Set together when the campaign
+    # is measurable (autoresearch template, benchmark sweeps). Leave
+    # unset for exploratory / free-form campaigns.
+    success_metric: str | None = None,
+    benchmark_command: str | None = None,
+    scope: str | None = None,
+    max_iterations: int | None = None,
 ) -> dict[str, Any]:
     """Create a new campaign for long-running, multi-step work.
 
@@ -182,6 +189,16 @@ async def create_campaign(
         max_depth: Max nesting depth for subtasks (default 4).
         token_budget: Optional token limit. NULL = unlimited.
         dry_run: If true, create in paused status for review.
+        success_metric: Short metric name emitted by the verifier /
+            benchmark (e.g. "accuracy_at_1k"). Paired with
+            ``benchmark_command``. Leave NULL for free-form campaigns.
+        benchmark_command: Shell / Python invocation that produces a
+            JSON line with the metric value. Metadata only — the
+            runner does not execute it; worker steps do.
+        scope: Freeform identifier narrowing the benchmark
+            (e.g. "chapter-01", "test_subset_A").
+        max_iterations: Hard cap on autoresearch-style loops. NULL
+            means open-ended (planner decides).
 
     Returns: Campaign ID, name, status, next_action_at.
 
@@ -197,6 +214,10 @@ async def create_campaign(
         token_budget=token_budget,
         priority=Priority(priority),
         status=status,
+        success_metric=success_metric,
+        benchmark_command=benchmark_command,
+        scope=scope,
+        max_iterations=max_iterations,
     )
     return {
         "id": str(campaign.id),
@@ -279,6 +300,12 @@ async def get_campaign(id: str) -> dict[str, Any]:
         "slot_seconds_used": campaign.slot_seconds_used,
         "weight": campaign.weight,
         "virtual_time": campaign.virtual_time,
+        # Typed success contract (migration 0005) — NULL for free-form
+        # campaigns, populated for autoresearch / templated campaigns.
+        "success_metric": campaign.success_metric,
+        "benchmark_command": campaign.benchmark_command,
+        "scope": campaign.scope,
+        "max_iterations": campaign.max_iterations,
         "steps": [
             {
                 "id": s.id,
@@ -426,6 +453,164 @@ async def provide_input(id: str, step_id: int, answer: str) -> dict[str, Any]:
         "status": step.status.value,
         "input_provided": True,
     }
+
+
+@coordinator_tool()
+async def check_success(id: str) -> dict[str, Any]:
+    """Evaluate whether a campaign has met its typed success contract.
+
+    A campaign's success contract (``success_metric``,
+    ``benchmark_command``, ``scope``, ``max_iterations``) is set at
+    creation time by templates like ``autoresearch``. This tool gives
+    the planner / coordinator a single scalar decision:
+
+    * ``met=True``  — contract satisfied; coordinator should mark the
+                      campaign ``done``.
+    * ``met=False`` — keep iterating, or escalate if budget exhausted.
+    * ``iterations_used`` — count of DONE atomic steps on this campaign
+                      so far. Useful for comparing against
+                      ``max_iterations``.
+    * ``metric_value`` — the most recently recorded metric from
+                      ``campaign_notes`` tagged ``metric:<success_metric>``
+                      (best-effort parse; see below).
+
+    **How the metric is discovered.** The runner / worker agents emit
+    a note of the form::
+
+        add_note(campaign_id, f"metric={value}", tags=["metric:<name>"])
+
+    on every benchmark run. ``check_success`` scans the most recent
+    such note, extracts the float after ``=``, and compares it against
+    ``success_metric_threshold`` if set via ``steer_campaign(strategy=...)``.
+    In v0.3 we only surface the most-recent value — the planner
+    decides whether it's "good enough". A future revision may wire a
+    numeric threshold column.
+
+    Args:
+        id: Campaign UUID.
+
+    Returns:
+        ``{met, metric_value, iterations_used, max_iterations,
+           success_metric, notes_checked, reason}``
+
+        ``reason`` is a short string explaining the decision — useful
+        both for humans looking at logs and for the planner's own
+        chain-of-thought.
+
+    A campaign without a success contract returns
+    ``{met: False, reason: "no_success_metric_configured"}``.
+
+    Next: if ``met`` is True, call ``cancel_campaign(id)`` or
+    ``steer_campaign(id, "wrap up")``. If False and
+    ``iterations_used >= max_iterations``, escalate via the
+    notification channel.
+    """
+    db = await get_db()
+    cid = UUID(id)
+    campaign = await db.get_campaign(cid)
+    if not campaign:
+        return {"error": f"Campaign {id} not found"}
+
+    if not campaign.success_metric:
+        return {
+            "met": False,
+            "reason": "no_success_metric_configured",
+            "success_metric": None,
+            "metric_value": None,
+            "iterations_used": 0,
+            "max_iterations": campaign.max_iterations,
+        }
+
+    # Count iterations = done atomic steps. ``skipped`` / ``failed``
+    # don't count as successful iterations for budget accounting.
+    done_steps = await db.get_steps(cid, status=StepStatus.DONE)
+    iterations_used = len(done_steps)
+
+    # Find the most recent "metric:<name>" tagged note; parse value.
+    tag = f"metric:{campaign.success_metric}"
+    notes = await db.get_notes(cid, tags=[tag])
+    metric_value: float | None = None
+    last_note_id: int | None = None
+    if notes:
+        # ``get_notes`` returns newest-first; grab the first parseable.
+        for n in notes:
+            val = _extract_metric_value(n.content)
+            if val is not None:
+                metric_value = val
+                last_note_id = n.id
+                break
+
+    # Termination logic — kept deliberately conservative:
+    #   * any recorded metric => ``met=True`` (planner decides threshold).
+    #   * budget exhausted without a metric => ``met=False, reason=budget``.
+    #   * otherwise => ``met=False, reason=still_running``.
+    # Thresholding is a v0.4 follow-up; today the contract is existence-
+    # of-signal, not magnitude-of-signal.
+    if metric_value is not None:
+        return {
+            "met": True,
+            "reason": "metric_recorded",
+            "success_metric": campaign.success_metric,
+            "metric_value": metric_value,
+            "iterations_used": iterations_used,
+            "max_iterations": campaign.max_iterations,
+            "notes_checked": len(notes),
+            "last_metric_note_id": last_note_id,
+        }
+    if (
+        campaign.max_iterations is not None
+        and iterations_used >= campaign.max_iterations
+    ):
+        return {
+            "met": False,
+            "reason": "max_iterations_reached_without_metric",
+            "success_metric": campaign.success_metric,
+            "metric_value": None,
+            "iterations_used": iterations_used,
+            "max_iterations": campaign.max_iterations,
+            "notes_checked": len(notes),
+        }
+    return {
+        "met": False,
+        "reason": "still_running",
+        "success_metric": campaign.success_metric,
+        "metric_value": None,
+        "iterations_used": iterations_used,
+        "max_iterations": campaign.max_iterations,
+        "notes_checked": len(notes),
+    }
+
+
+def _extract_metric_value(text: str) -> float | None:
+    """Parse the most permissive ``key=number`` form from a note body.
+
+    Accepts any of::
+
+        metric=0.83
+        accuracy_at_1k = 0.742
+        metric: 12.5
+        Final: 99.9%     (% is stripped)
+        result=-3.2e-2
+
+    Returns ``None`` if no numeric value could be extracted. Designed
+    to be forgiving so workers don't need a rigid report format —
+    producers write what's natural, ``check_success`` squints at it.
+    """
+    import re
+
+    # Strip trailing percent sign; it's a unit, not a separator.
+    candidate_patterns = [
+        r"[=:]\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*%?",  # key=value or key:value
+        r"\b(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*%?\s*$",  # trailing number
+    ]
+    for pat in candidate_patterns:
+        m = re.search(pat, text)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                continue
+    return None
 
 
 @coordinator_tool()

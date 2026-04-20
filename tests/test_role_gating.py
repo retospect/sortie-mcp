@@ -52,6 +52,7 @@ def _run_role(role: str) -> set[str]:
 
 
 COORD_TOOLS = {
+    "check_success",
     "create_campaign",
     "list_campaigns",
     "get_campaign",

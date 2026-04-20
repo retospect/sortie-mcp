@@ -140,6 +140,7 @@ class TestToolRegistration:
             "resume_campaign",
             "cancel_campaign",
             "provide_input",
+            "check_success",  # new in v0.3.0 — typed success contract
         ):
             assert tool in names, f"Missing coordinator tool: {tool}"
 
@@ -173,9 +174,10 @@ class TestToolRegistration:
 
     def test_total_tool_count(self) -> None:
         names = self._tool_names()
-        # 9 coordinator + 11 worker = 20
-        # (worker +2: read_step_output, heartbeat — both new in v0.2.0)
-        assert len(names) == 20, f"Expected 20 tools, got {len(names)}: {names}"
+        # 10 coordinator + 11 worker = 21.
+        # v0.2.0: +2 worker (read_step_output, heartbeat).
+        # v0.3.0: +1 coordinator (check_success).
+        assert len(names) == 21, f"Expected 21 tools, got {len(names)}: {names}"
 
 
 # ---------------------------------------------------------------------------
@@ -957,3 +959,290 @@ class TestClaimTokenEnforcement:
         _, kwargs = db.complete_step.call_args
         assert kwargs["claim_token"] is None
         assert result["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# v0.3.0 — typed success contract (B4)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractMetricValue:
+    """``_extract_metric_value`` is forgiving by design — producers
+    write natural prose, the parser finds a number."""
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("metric=0.83", 0.83),
+            ("accuracy_at_1k = 0.742", 0.742),
+            ("metric: 12.5", 12.5),
+            ("Final: 99.9%", 99.9),
+            ("result=-3.2e-2", -0.032),
+            ("Score: 1.0", 1.0),
+            ("the answer is 42", 42.0),  # trailing number fallback
+            ("pass rate 98.5%", 98.5),
+        ],
+    )
+    def test_parses_various_forms(self, text: str, expected: float) -> None:
+        from sortie_mcp.server import _extract_metric_value
+
+        got = _extract_metric_value(text)
+        assert got is not None
+        assert got == pytest.approx(expected)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "no numbers here",
+            "completed",
+            "   ",
+        ],
+    )
+    def test_returns_none_for_non_numeric(self, text: str) -> None:
+        from sortie_mcp.server import _extract_metric_value
+
+        assert _extract_metric_value(text) is None
+
+
+class TestCheckSuccess:
+    async def test_campaign_without_contract_returns_not_met(self) -> None:
+        """Free-form campaigns (no ``success_metric``) short-circuit to
+        ``met=False, reason=no_success_metric_configured`` so the
+        planner can tell "this campaign wasn't designed for
+        autochecking"."""
+        from sortie_mcp.server import check_success
+
+        db = mock_db()
+        cid = uuid4()
+        campaign = make_campaign(id=cid, success_metric=None)
+        db.get_campaign.return_value = campaign
+
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await check_success(str(cid))
+
+        assert result["met"] is False
+        assert result["reason"] == "no_success_metric_configured"
+        # Must NOT call downstream note/step lookups for this short-circuit.
+        db.get_notes.assert_not_awaited()
+        db.get_steps.assert_not_awaited()
+
+    async def test_not_found_returns_error(self) -> None:
+        from sortie_mcp.server import check_success
+
+        db = mock_db()
+        db.get_campaign.return_value = None
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await check_success(str(uuid4()))
+        assert "error" in result
+
+    async def test_met_when_metric_note_present(self) -> None:
+        """A note tagged ``metric:<name>`` with a parseable value
+        flips ``met`` to True."""
+        from sortie_mcp.server import check_success
+
+        db = mock_db()
+        cid = uuid4()
+        campaign = make_campaign(
+            id=cid,
+            success_metric="accuracy_at_1k",
+            max_iterations=10,
+        )
+        db.get_campaign.return_value = campaign
+        db.get_steps.return_value = [
+            make_step(id=i, status=StepStatus.DONE, campaign_id=cid) for i in range(3)
+        ]
+        db.get_notes.return_value = [
+            make_note(
+                id=99,
+                campaign_id=cid,
+                content="Benchmark result: accuracy_at_1k=0.92",
+                tags=["metric:accuracy_at_1k"],
+            )
+        ]
+
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await check_success(str(cid))
+
+        assert result["met"] is True
+        assert result["reason"] == "metric_recorded"
+        assert result["metric_value"] == pytest.approx(0.92)
+        assert result["iterations_used"] == 3
+        assert result["max_iterations"] == 10
+        assert result["last_metric_note_id"] == 99
+        # The query must have been scoped to the metric tag.
+        db.get_notes.assert_awaited_once_with(cid, tags=["metric:accuracy_at_1k"])
+
+    async def test_iterations_count_only_done_steps(self) -> None:
+        """``iterations_used`` must reflect DONE steps only — pending
+        or failed steps don't count as completed iterations."""
+        from sortie_mcp.server import check_success
+
+        db = mock_db()
+        cid = uuid4()
+        campaign = make_campaign(id=cid, success_metric="m", max_iterations=5)
+        db.get_campaign.return_value = campaign
+        db.get_steps.return_value = [
+            make_step(id=1, status=StepStatus.DONE, campaign_id=cid),
+            make_step(id=2, status=StepStatus.DONE, campaign_id=cid),
+        ]
+        db.get_notes.return_value = []
+
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await check_success(str(cid))
+
+        # The mock must be filtered by status=DONE — assert the call shape.
+        db.get_steps.assert_awaited_once_with(cid, status=StepStatus.DONE)
+        assert result["iterations_used"] == 2
+
+    async def test_budget_exhausted_without_metric(self) -> None:
+        """When ``max_iterations`` is reached and no metric note
+        exists, the reason surfaces as
+        ``max_iterations_reached_without_metric`` so the coordinator
+        can decide to escalate."""
+        from sortie_mcp.server import check_success
+
+        db = mock_db()
+        cid = uuid4()
+        campaign = make_campaign(id=cid, success_metric="m", max_iterations=3)
+        db.get_campaign.return_value = campaign
+        db.get_steps.return_value = [
+            make_step(id=i, status=StepStatus.DONE, campaign_id=cid) for i in range(3)
+        ]
+        db.get_notes.return_value = []
+
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await check_success(str(cid))
+
+        assert result["met"] is False
+        assert result["reason"] == "max_iterations_reached_without_metric"
+        assert result["iterations_used"] == 3
+
+    async def test_still_running_when_neither_metric_nor_budget(self) -> None:
+        from sortie_mcp.server import check_success
+
+        db = mock_db()
+        cid = uuid4()
+        campaign = make_campaign(id=cid, success_metric="m", max_iterations=10)
+        db.get_campaign.return_value = campaign
+        db.get_steps.return_value = [
+            make_step(id=1, status=StepStatus.DONE, campaign_id=cid)
+        ]
+        db.get_notes.return_value = []
+
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await check_success(str(cid))
+
+        assert result["met"] is False
+        assert result["reason"] == "still_running"
+
+    async def test_unparseable_notes_do_not_count(self) -> None:
+        """A metric-tagged note that doesn't contain a parseable
+        number is ignored (``metric_value`` stays None). This prevents
+        a chatty worker from accidentally declaring success with a
+        prose-only update."""
+        from sortie_mcp.server import check_success
+
+        db = mock_db()
+        cid = uuid4()
+        campaign = make_campaign(id=cid, success_metric="m", max_iterations=10)
+        db.get_campaign.return_value = campaign
+        db.get_steps.return_value = []
+        db.get_notes.return_value = [
+            make_note(
+                id=1,
+                campaign_id=cid,
+                content="benchmark started, no result yet",
+                tags=["metric:m"],
+            )
+        ]
+
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await check_success(str(cid))
+
+        assert result["met"] is False
+        assert result["reason"] == "still_running"
+        assert result["notes_checked"] == 1
+
+
+class TestCreateCampaignWithSuccessContract:
+    """B4: create_campaign forwards the success-contract args to DB."""
+
+    async def test_forwards_contract_fields(self) -> None:
+        from sortie_mcp.server import create_campaign
+
+        db = mock_db()
+        db.create_campaign.return_value = make_campaign(
+            success_metric="m",
+            benchmark_command="run bench",
+            scope="chapter-1",
+            max_iterations=20,
+        )
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await create_campaign(
+                goal="Optimize",
+                success_metric="m",
+                benchmark_command="run bench",
+                scope="chapter-1",
+                max_iterations=20,
+            )
+
+        _, kwargs = db.create_campaign.call_args
+        assert kwargs["success_metric"] == "m"
+        assert kwargs["benchmark_command"] == "run bench"
+        assert kwargs["scope"] == "chapter-1"
+        assert kwargs["max_iterations"] == 20
+        # Response still has the campaign identity fields.
+        assert "id" in result
+        assert result["status"] == "active"
+
+    async def test_omitted_contract_fields_default_to_none(self) -> None:
+        """Free-form campaigns pass None so the column stays NULL."""
+        from sortie_mcp.server import create_campaign
+
+        db = mock_db()
+        db.create_campaign.return_value = make_campaign()
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            await create_campaign(goal="Research")
+
+        _, kwargs = db.create_campaign.call_args
+        assert kwargs["success_metric"] is None
+        assert kwargs["benchmark_command"] is None
+        assert kwargs["scope"] is None
+        assert kwargs["max_iterations"] is None
+
+
+class TestGetCampaignSurface:
+    """``get_campaign`` must surface the v0.3.0 additions so operators
+    and the planner can read the full state in one call."""
+
+    async def test_exposes_fair_share_and_success_contract(self) -> None:
+        from sortie_mcp.server import get_campaign
+
+        db = mock_db()
+        cid = uuid4()
+        campaign = make_campaign(
+            id=cid,
+            slot_seconds_used=42.5,
+            weight=8.0,
+            success_metric="metric_a",
+            benchmark_command="run",
+            scope="s",
+            max_iterations=50,
+        )
+        db.get_campaign.return_value = campaign
+        db.get_steps.return_value = []
+        db.get_notes.return_value = []
+
+        with patch("sortie_mcp.server.get_db", return_value=db):
+            result = await get_campaign(str(cid))
+
+        # Fair-share ledger
+        assert result["slot_seconds_used"] == pytest.approx(42.5)
+        assert result["weight"] == 8.0
+        assert result["virtual_time"] == pytest.approx(42.5 / 8.0)
+        # Success contract
+        assert result["success_metric"] == "metric_a"
+        assert result["benchmark_command"] == "run"
+        assert result["scope"] == "s"
+        assert result["max_iterations"] == 50

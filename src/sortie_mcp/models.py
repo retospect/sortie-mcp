@@ -127,6 +127,12 @@ class Campaign:
     # Fair-share scheduler accounting (migration 0004).
     slot_seconds_used: float = 0.0
     weight: float = 2.0  # matches NORMAL; overwritten by create_campaign
+    # Typed success contract (migration 0005). All four are set by
+    # workflow templates (V2) and left NULL for free-form campaigns.
+    success_metric: str | None = None
+    benchmark_command: str | None = None
+    scope: str | None = None
+    max_iterations: int | None = None
 
     @property
     def virtual_time(self) -> float:

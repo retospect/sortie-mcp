@@ -473,6 +473,38 @@ class TestFairShareAccounting:
 
 
 @pytest.mark.postgres
+class TestSuccessContract:
+    """Migration 0005 — typed success contract columns."""
+
+    async def test_free_form_campaign_leaves_contract_null(self, db) -> None:
+        """Campaigns created without the v0.3 args have NULL contract
+        columns. Back-compat with v0.2 callers."""
+        c = await db.create_campaign("plain goal")
+        refreshed = await db.get_campaign(c.id)
+        assert refreshed is not None
+        assert refreshed.success_metric is None
+        assert refreshed.benchmark_command is None
+        assert refreshed.scope is None
+        assert refreshed.max_iterations is None
+
+    async def test_templated_campaign_persists_contract(self, db) -> None:
+        """All four fields round-trip through the INSERT/SELECT path."""
+        c = await db.create_campaign(
+            "autoresearch goal",
+            success_metric="accuracy_at_1k",
+            benchmark_command="python bench.py --k 1000",
+            scope="test_subset_A",
+            max_iterations=25,
+        )
+        refreshed = await db.get_campaign(c.id)
+        assert refreshed is not None
+        assert refreshed.success_metric == "accuracy_at_1k"
+        assert refreshed.benchmark_command == "python bench.py --k 1000"
+        assert refreshed.scope == "test_subset_A"
+        assert refreshed.max_iterations == 25
+
+
+@pytest.mark.postgres
 class TestNotifications:
     async def test_notify_and_deliver(self, db) -> None:
         from sortie_mcp.models import NotificationLevel

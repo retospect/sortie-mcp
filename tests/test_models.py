@@ -192,6 +192,11 @@ class TestCampaignDataclass:
             # Fair-share columns (migration 0004)
             "slot_seconds_used",
             "weight",
+            # Typed success contract (migration 0005)
+            "success_metric",
+            "benchmark_command",
+            "scope",
+            "max_iterations",
         }
         assert field_names == expected
 

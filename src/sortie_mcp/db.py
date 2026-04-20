@@ -128,6 +128,11 @@ class DB:
             # Fair-share columns (migration 0004).
             slot_seconds_used=float(row["slot_seconds_used"]),
             weight=float(row["weight"]),
+            # Typed success contract (migration 0005).
+            success_metric=row["success_metric"],
+            benchmark_command=row["benchmark_command"],
+            scope=row["scope"],
+            max_iterations=row["max_iterations"],
         )
 
     def _row_to_step(self, row: asyncpg.Record) -> Step:
@@ -209,6 +214,13 @@ class DB:
         failure_policy: FailurePolicy = FailurePolicy.CONTINUE,
         priority: Priority = Priority.NORMAL,
         status: CampaignStatus = CampaignStatus.ACTIVE,
+        # Typed success contract (migration 0005). Templates set these
+        # together; free-form campaigns pass None and the contract is
+        # advisory at best.
+        success_metric: str | None = None,
+        benchmark_command: str | None = None,
+        scope: str | None = None,
+        max_iterations: int | None = None,
     ) -> Campaign:
         # Pin the fair-share weight at INSERT time so it's a stable,
         # observable property of the row — changing priority later
@@ -218,8 +230,10 @@ class DB:
             f"""
             INSERT INTO {self._t("campaigns")}
                 (name, goal, status, channel, user_id, max_depth,
-                 token_budget, failure_policy, priority, weight)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 token_budget, failure_policy, priority, weight,
+                 success_metric, benchmark_command, scope, max_iterations)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    $11, $12, $13, $14)
             RETURNING *
             """,
             name,
@@ -232,6 +246,10 @@ class DB:
             failure_policy.value,
             priority.value,
             weight,
+            success_metric,
+            benchmark_command,
+            scope,
+            max_iterations,
         )
         return self._row_to_campaign(row)
 

@@ -273,6 +273,12 @@ async def get_campaign(id: str) -> dict[str, Any]:
         "max_depth": campaign.max_depth,
         "tokens_used": campaign.tokens_used,
         "token_budget": campaign.token_budget,
+        # Fair-share scheduler state (migration 0004) — surfaced so
+        # humans/operators can see where the compute has gone and why
+        # a campaign might be waiting behind a more-entitled sibling.
+        "slot_seconds_used": campaign.slot_seconds_used,
+        "weight": campaign.weight,
+        "virtual_time": campaign.virtual_time,
         "steps": [
             {
                 "id": s.id,

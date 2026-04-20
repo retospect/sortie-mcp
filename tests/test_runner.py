@@ -26,12 +26,24 @@ from sortie_mcp.runner import Runner
 
 
 def make_campaign(**overrides) -> Campaign:
+    """Build a test campaign.
+
+    Mirrors ``DB.create_campaign``: when the caller doesn't override
+    ``weight``, it is pinned from ``priority`` via
+    :func:`sortie_mcp.models.priority_weight`. This keeps fair-share
+    (WDRR) tests realistic — in production every campaign row has a
+    priority-derived weight from the INSERT.
+    """
+    from sortie_mcp.models import priority_weight
+
+    priority = overrides.get("priority", Priority.NORMAL)
     defaults = dict(
         id=uuid4(),
         name="Test Campaign",
         goal="Test goal",
         status=CampaignStatus.ACTIVE,
-        priority=Priority.NORMAL,
+        priority=priority,
+        weight=priority_weight(priority),
         max_depth=4,
         token_budget=None,
         tokens_used=0,
@@ -138,51 +150,125 @@ class TestRunnerTick:
 # ---------------------------------------------------------------------------
 
 
-class TestPriorityScheduling:
-    async def test_urgent_gets_all_slots(self, runner, mock_db) -> None:
-        urgent = make_campaign(priority=Priority.URGENT)
-        normal = make_campaign(priority=Priority.NORMAL)
+class TestWDRRScheduling:
+    """Runner.tick() uses the WDRR picker from ``sortie_mcp.scheduler``."""
+
+    async def test_urgent_served_before_normal_on_fresh_start(
+        self, runner, mock_db
+    ) -> None:
+        """Fresh campaigns have vt=0 → priority tiebreak kicks in and
+        URGENT wins the first slot."""
+        urgent = make_campaign(priority=Priority.URGENT, name="U")
+        normal = make_campaign(priority=Priority.NORMAL, name="N")
         mock_db.reset_zombies.return_value = 0
         mock_db.count_running.return_value = 0
         mock_db.get_due_campaigns.return_value = [urgent, normal]
         mock_db.get_undelivered_notifications.return_value = []
 
-        dispatched = {}
+        order = []
 
         async def track_dispatch(campaign, max_slots):
-            dispatched[campaign.priority] = max_slots
-            return min(max_slots, 2)  # Pretend we dispatched 2
+            order.append(campaign.name)
+            return 1  # dispatched one slot
 
         with patch.object(runner, "_dispatch_campaign", side_effect=track_dispatch):
             await runner.tick()
 
-        # Urgent should get slots first
-        assert Priority.URGENT in dispatched
-        assert dispatched[Priority.URGENT] >= 1
+        # URGENT wins the first pick; normal only gets later slots once
+        # URGENT's vt rises. Since we charge 0 slot-seconds from the
+        # mock (campaign objects in-memory aren't mutated by tick), the
+        # picker stays on URGENT until max_concurrent is exhausted.
+        assert order[0] == "U"
 
-    async def test_multiple_campaigns_same_tier_share_slots(
-        self, runner, mock_db
-    ) -> None:
-        c1 = make_campaign(priority=Priority.NORMAL, name="C1")
-        c2 = make_campaign(priority=Priority.NORMAL, name="C2")
+    async def test_each_slot_is_a_separate_dispatch_call(self, runner, mock_db) -> None:
+        """WDRR issues ``max_slots=1`` per iteration so the picker sees
+        each slot individually. Contrast with the v0.1 tier-fraction
+        allocator which could hand a campaign many slots at once."""
+        c = make_campaign(priority=Priority.NORMAL)
         mock_db.reset_zombies.return_value = 0
         mock_db.count_running.return_value = 0
-        mock_db.get_due_campaigns.return_value = [c1, c2]
+        mock_db.get_due_campaigns.return_value = [c]
         mock_db.get_undelivered_notifications.return_value = []
 
         calls = []
 
         async def track_dispatch(campaign, max_slots):
-            calls.append((campaign.name, max_slots))
-            return 0
+            calls.append(max_slots)
+            return 1
 
         with patch.object(runner, "_dispatch_campaign", side_effect=track_dispatch):
             await runner.tick()
 
-        # Both should get called
-        names = [c[0] for c in calls]
-        assert "C1" in names
-        assert "C2" in names
+        # Default SORTIE_MAX_CONCURRENT=4 → 4 slot-sized calls.
+        assert calls == [1, 1, 1, 1]
+
+    async def test_unavailable_campaign_skipped_rest_of_tick(
+        self, runner, mock_db
+    ) -> None:
+        """A campaign whose only ready step is lock-busy (dispatch
+        returns 0) must be excluded for the remainder of the tick so
+        the runner doesn't spin on it."""
+        busy = make_campaign(priority=Priority.URGENT, name="busy")
+        free = make_campaign(priority=Priority.LOW, name="free")
+        mock_db.reset_zombies.return_value = 0
+        mock_db.count_running.return_value = 0
+        mock_db.get_due_campaigns.return_value = [busy, free]
+        mock_db.get_undelivered_notifications.return_value = []
+
+        calls = []
+
+        async def track_dispatch(campaign, max_slots):
+            calls.append(campaign.name)
+            # First campaign tried is URGENT (wins on tier tiebreak) —
+            # pretend it's lock-busy by returning 0.
+            if campaign.name == "busy":
+                return 0
+            return 1
+
+        with patch.object(runner, "_dispatch_campaign", side_effect=track_dispatch):
+            await runner.tick()
+
+        # busy is tried once, then excluded; free gets the rest of the slots.
+        assert calls.count("busy") == 1
+        assert calls.count("free") >= 1
+
+    async def test_background_heavily_deferred_when_normal_has_work(
+        self, runner, mock_db
+    ) -> None:
+        """A BACKGROUND campaign with slot_seconds_used=0 still has
+        vt=0, but its next pick after charging 0.5 slot-seconds is vt=1,
+        which a fresh NORMAL (vt=0) will beat."""
+        # In the live runner, charging happens via DB — we simulate by
+        # mutating slot_seconds_used in the track_dispatch callback so
+        # the picker sees the updated vt on subsequent iterations.
+        bg = make_campaign(
+            priority=Priority.BACKGROUND, name="bg", slot_seconds_used=0.0
+        )
+        normal = make_campaign(
+            priority=Priority.NORMAL, name="normal", slot_seconds_used=0.0
+        )
+        mock_db.reset_zombies.return_value = 0
+        mock_db.count_running.return_value = 0
+        mock_db.get_due_campaigns.return_value = [bg, normal]
+        mock_db.get_undelivered_notifications.return_value = []
+
+        order = []
+
+        async def track_dispatch(campaign, max_slots):
+            order.append(campaign.name)
+            # Charge a full slot-second to the picked campaign.
+            campaign.slot_seconds_used += 1
+            return 1
+
+        with patch.object(runner, "_dispatch_campaign", side_effect=track_dispatch):
+            await runner.tick()
+
+        # Expected per-slot vts (weight_normal=2, weight_bg=0.5):
+        #   slot 1: normal=0/2=0, bg=0/0.5=0 → tie, normal wins (tier)
+        #   slot 2: normal=1/2=0.5, bg=0/0.5=0 → bg wins
+        #   slot 3: normal=1/2=0.5, bg=1/0.5=2 → normal wins
+        #   slot 4: normal=2/2=1, bg=1/0.5=2 → normal wins
+        assert order == ["normal", "bg", "normal", "normal"]
 
 
 # ---------------------------------------------------------------------------

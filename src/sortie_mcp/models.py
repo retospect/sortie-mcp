@@ -69,6 +69,37 @@ PRIORITY_ORDER: list[Priority] = [
 
 
 # ---------------------------------------------------------------------------
+# Priority → weight mapping used by the fair-share (WDRR) scheduler.
+#
+# Virtual time = ``campaign.slot_seconds_used / campaign.weight``. The
+# picker always serves the campaign with the lowest virtual time that
+# has ready work. Higher priority → higher weight → slower virtual-time
+# growth → more slot-seconds before falling behind.
+#
+# **Keep in sync with** the backfill ``UPDATE`` in
+# ``migrations/0004.fair-share.sql``.
+# ---------------------------------------------------------------------------
+
+PRIORITY_WEIGHTS: dict[Priority, float] = {
+    Priority.URGENT: 8.0,
+    Priority.HIGH: 4.0,
+    Priority.NORMAL: 2.0,
+    Priority.LOW: 1.0,
+    Priority.BACKGROUND: 0.5,
+}
+
+
+def priority_weight(priority: Priority) -> float:
+    """Return the WDRR weight for a given priority.
+
+    Unknown priorities fall back to ``NORMAL``'s weight (2.0) rather
+    than raising — this mirrors the SQL ``CASE`` in migration 0004 and
+    keeps the picker robust to future enum additions.
+    """
+    return PRIORITY_WEIGHTS.get(priority, PRIORITY_WEIGHTS[Priority.NORMAL])
+
+
+# ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
 
@@ -93,6 +124,19 @@ class Campaign:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     completed_at: datetime | None = None
+    # Fair-share scheduler accounting (migration 0004).
+    slot_seconds_used: float = 0.0
+    weight: float = 2.0  # matches NORMAL; overwritten by create_campaign
+
+    @property
+    def virtual_time(self) -> float:
+        """Picker key: lower = more entitled to the next slot.
+
+        ``weight`` is clamped to a small positive floor so a mis-migrated
+        row with ``weight=0`` can't cause division-by-zero. The floor is
+        small enough (1e-6) that a real weight of 0.5 still dominates.
+        """
+        return self.slot_seconds_used / max(self.weight, 1e-6)
 
 
 @dataclass

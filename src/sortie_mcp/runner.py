@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import os
 from typing import Any
 
@@ -24,16 +23,15 @@ import httpx
 from .db import DB
 from .locks import default_owner
 from .models import (
-    PRIORITY_ORDER,
     Campaign,
     CampaignStatus,
     FailurePolicy,
     NotificationLevel,
-    Priority,
     Step,
     StepStatus,
     StepType,
 )
+from .scheduler import pick_next_campaign
 
 log = logging.getLogger(__name__)
 
@@ -102,40 +100,32 @@ class Runner:
             log.info("At capacity, tick done (housekeeping only)")
             return
 
-        # 3. Get due campaigns sorted by priority
+        # 3. Get due campaigns sorted by virtual time (WDRR).
         campaigns = await self.db.get_due_campaigns()
         if not campaigns:
             log.info("No due campaigns, tick done")
             await self._deliver_notifications()
             return
 
-        # 4. Allocate slots by priority tier (round-robin within tier)
+        # 4. Fair-share dispatch: pick one campaign, dispatch one slot,
+        #    let the virtual-time math decide the next pick. A campaign
+        #    that turns out to have only lock-busy ready steps is
+        #    temporarily excluded for the remainder of this tick so we
+        #    don't spin on it — pending steps will be retried next tick.
         slots_remaining = available
-        for priority in PRIORITY_ORDER:
-            if slots_remaining <= 0:
+        unavailable: set = set()  # campaign IDs to skip for this tick only
+        while slots_remaining > 0:
+            pick = pick_next_campaign(campaigns, exclude=unavailable)
+            if pick is None:
                 break
-            tier_campaigns = [c for c in campaigns if c.priority == priority]
-            if not tier_campaigns:
+            dispatched = await self._dispatch_campaign(pick, max_slots=1)
+            if dispatched == 0:
+                # Either no ready steps after consulting planner, or
+                # every ready step was lock-busy. Either way: skip for
+                # the rest of this tick; slot_seconds_used doesn't grow.
+                unavailable.add(pick.id)
                 continue
-
-            # Tier allocation: urgent gets all, high gets 3/4, etc.
-            tier_fraction = {
-                Priority.URGENT: 1.0,
-                Priority.HIGH: 0.75,
-                Priority.NORMAL: 0.5,
-                Priority.LOW: 0.25,
-                Priority.BACKGROUND: 0.25,
-            }[priority]
-            tier_slots = max(1, math.ceil(slots_remaining * tier_fraction))
-            per_campaign = max(1, math.ceil(tier_slots / len(tier_campaigns)))
-
-            for campaign in tier_campaigns:
-                if slots_remaining <= 0:
-                    break
-                dispatched = await self._dispatch_campaign(
-                    campaign, min(per_campaign, slots_remaining)
-                )
-                slots_remaining -= dispatched
+            slots_remaining -= dispatched
 
         # 5. Deliver notifications
         await self._deliver_notifications()

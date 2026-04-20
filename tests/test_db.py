@@ -361,6 +361,118 @@ class TestNotes:
 
 
 @pytest.mark.postgres
+class TestFairShareAccounting:
+    """Migration 0004: ``campaigns.slot_seconds_used`` / ``weight``."""
+
+    async def test_new_campaign_pins_weight_from_priority(self, db) -> None:
+        """``DB.create_campaign`` must persist the priority-derived
+        weight so WDRR ordering works from the first tick onward."""
+        from sortie_mcp.models import Priority
+
+        c_urgent = await db.create_campaign("urgent goal", priority=Priority.URGENT)
+        c_bg = await db.create_campaign("bg goal", priority=Priority.BACKGROUND)
+
+        assert c_urgent.weight == 8.0
+        assert c_bg.weight == 0.5
+        assert c_urgent.slot_seconds_used == 0.0
+        assert c_bg.slot_seconds_used == 0.0
+
+    async def test_complete_step_charges_slot_seconds(self, db) -> None:
+        """A successful step charges its wall-clock duration to the
+        campaign ledger so subsequent WDRR picks see higher virtual
+        time."""
+        campaign = await db.create_campaign("Goal")
+        step = await db.add_step(campaign.id, "Step", agent="research")
+        await db.claim_step(step.id)
+
+        # Simulate an agent reporting 2500ms of wall-clock work.
+        await db.complete_step(step.id, "done", duration_ms=2500)
+
+        refreshed = await db.get_campaign(campaign.id)
+        assert refreshed is not None
+        # Charged at 2.5s; allow small floating-point slack.
+        assert 2.4 <= refreshed.slot_seconds_used <= 2.6
+
+    async def test_fail_step_also_charges(self, db) -> None:
+        """Compute was spent whether the step succeeded or not — the
+        ledger must grow on failures too, or a flaky campaign would
+        monopolise slots."""
+        campaign = await db.create_campaign("Goal")
+        step = await db.add_step(campaign.id, "Step", agent="research")
+        await db.claim_step(step.id)
+        # Pretend half a second passed.
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                f"UPDATE {db._t('campaign_steps')} "
+                f"SET started_at = now() - interval '500 ms' "
+                f"WHERE id = $1",
+                step.id,
+            )
+
+        await db.fail_step(step.id, "nope")
+
+        refreshed = await db.get_campaign(campaign.id)
+        assert refreshed is not None
+        # Retry path (not final-failed) — should still charge ~0.5s.
+        assert refreshed.slot_seconds_used > 0
+
+    async def test_missing_started_at_charges_zero(self, db) -> None:
+        """A step somehow terminating without a claimed-started_at
+        (edge case / test fixture) is charged zero rather than
+        crashing."""
+        campaign = await db.create_campaign("Goal")
+        step = await db.add_step(campaign.id, "Step", agent="research")
+        # Don't claim — jump straight to complete with no duration.
+        await db.complete_step(step.id, "manual")
+
+        refreshed = await db.get_campaign(campaign.id)
+        assert refreshed is not None
+        assert refreshed.slot_seconds_used == 0.0
+
+    async def test_charge_is_capped_per_step(self, db, monkeypatch) -> None:
+        """``SORTIE_MAX_STEP_SECONDS`` caps the charge so a stuck step
+        can't permanently starve its campaign. Default 1h."""
+        monkeypatch.setenv("SORTIE_MAX_STEP_SECONDS", "5")
+        campaign = await db.create_campaign("Goal")
+        step = await db.add_step(campaign.id, "Step", agent="research")
+        await db.claim_step(step.id)
+        # Report a 10-minute step.
+        await db.complete_step(step.id, "slow", duration_ms=600_000)
+
+        refreshed = await db.get_campaign(campaign.id)
+        assert refreshed is not None
+        # Capped at 5s despite the 600s duration report.
+        assert refreshed.slot_seconds_used == pytest.approx(5.0, abs=0.01)
+
+    async def test_get_due_campaigns_orders_by_virtual_time(self, db) -> None:
+        """The SQL ``ORDER BY slot_seconds_used / weight`` puts the
+        most-entitled campaign first in the result list — this is what
+        ``runner.tick()`` consumes."""
+        from sortie_mcp.models import Priority
+
+        # Three campaigns; simulate uneven usage.
+        a = await db.create_campaign("A", priority=Priority.NORMAL)  # vt=0
+        b = await db.create_campaign("B", priority=Priority.NORMAL)
+        c = await db.create_campaign("C", priority=Priority.NORMAL)
+        async with db.pool.acquire() as conn:
+            # Pretend A has spent 100s, C has spent 50s, B is untouched.
+            await conn.execute(
+                f"UPDATE {db._t('campaigns')} SET slot_seconds_used = 100 WHERE id = $1",
+                a.id,
+            )
+            await conn.execute(
+                f"UPDATE {db._t('campaigns')} SET slot_seconds_used = 50 WHERE id = $1",
+                c.id,
+            )
+
+        due = await db.get_due_campaigns()
+        # B first (vt=0), C next (vt=25), A last (vt=50).
+        ids_in_order = [x.id for x in due]
+        assert ids_in_order.index(b.id) < ids_in_order.index(c.id)
+        assert ids_in_order.index(c.id) < ids_in_order.index(a.id)
+
+
+@pytest.mark.postgres
 class TestNotifications:
     async def test_notify_and_deliver(self, db) -> None:
         from sortie_mcp.models import NotificationLevel

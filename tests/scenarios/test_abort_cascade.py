@@ -39,9 +39,7 @@ class TestBranchAbort:
         """
         campaign = await db.create_campaign("Abort test", name="Abort")
 
-        p = await db.add_step(
-            campaign.id, "Parent", step_type=StepType.PARALLEL_GROUP
-        )
+        p = await db.add_step(campaign.id, "Parent", step_type=StepType.PARALLEL_GROUP)
         a = await db.add_step(
             campaign.id,
             "Branch A",
@@ -115,9 +113,7 @@ class TestAbortValidation:
         """Targeting a done step raises ValueError."""
         campaign = await db.create_campaign("Guard test", name="Guard")
         parent = await db.add_step(campaign.id, "Parent")
-        child = await db.add_step(
-            campaign.id, "Child", parent_step_id=parent.id
-        )
+        child = await db.add_step(campaign.id, "Child", parent_step_id=parent.id)
 
         # Complete the parent
         await db.claim_step(parent.id)

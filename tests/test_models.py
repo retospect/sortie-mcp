@@ -189,6 +189,9 @@ class TestCampaignDataclass:
             "created_at",
             "updated_at",
             "completed_at",
+            # Fair-share columns (migration 0004)
+            "slot_seconds_used",
+            "weight",
         }
         assert field_names == expected
 

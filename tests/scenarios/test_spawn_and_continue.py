@@ -22,9 +22,7 @@ class TestSpawnAndContinue:
         """A→B chain. A spawns S1,S2 + continuation. B retargeted to cont."""
         campaign = await db.create_campaign("Splice test", name="Splice")
         a = await db.add_step(campaign.id, "Step A", agent="research")
-        b = await db.add_step(
-            campaign.id, "Step B", agent="writing", depends_on=[a.id]
-        )
+        b = await db.add_step(campaign.id, "Step B", agent="writing", depends_on=[a.id])
 
         # Claim A so it's running
         await db.claim_step(a.id)
@@ -81,9 +79,7 @@ class TestSpawnAndContinue:
         """Complete the full chain: subtasks → continuation → B."""
         campaign = await db.create_campaign("Chain test", name="Chain")
         a = await db.add_step(campaign.id, "Step A", agent="research")
-        b = await db.add_step(
-            campaign.id, "Step B", agent="writing", depends_on=[a.id]
-        )
+        b = await db.add_step(campaign.id, "Step B", agent="writing", depends_on=[a.id])
 
         await db.claim_step(a.id)
         result = await db.spawn_and_continue(
@@ -117,9 +113,7 @@ class TestSpawnAndContinue:
         campaign = await db.create_campaign(
             "Depth limit", name="DepthLimit", max_depth=1
         )
-        a = await db.add_step(
-            campaign.id, "Step A", agent="research", depth=1
-        )
+        a = await db.add_step(campaign.id, "Step A", agent="research", depth=1)
         await db.claim_step(a.id)
 
         with pytest.raises(ValueError, match="Depth limit"):
@@ -149,9 +143,7 @@ class TestCanonicalResolution:
         cont_id = result["continuation_id"]
 
         # Add new step that depends on the original A
-        d = await db.add_step(
-            campaign.id, "D depends on A", depends_on=[a.id]
-        )
+        d = await db.add_step(campaign.id, "D depends on A", depends_on=[a.id])
 
         # D's depends_on should be resolved to the continuation
         d_step = await db.get_step(d.id)

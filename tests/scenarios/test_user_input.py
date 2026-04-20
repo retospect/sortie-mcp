@@ -134,9 +134,7 @@ class TestUserInputLifecycle:
         """Step with deps: request input doesn't break dependency chain."""
         campaign = await db.create_campaign("Dep input", name="DepInput")
         a = await db.add_step(campaign.id, "Step A", agent="research")
-        b = await db.add_step(
-            campaign.id, "Step B", agent="writing", depends_on=[a.id]
-        )
+        b = await db.add_step(campaign.id, "Step B", agent="writing", depends_on=[a.id])
 
         # Complete A normally
         await db.claim_step(a.id)

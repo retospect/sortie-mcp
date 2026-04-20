@@ -10,8 +10,6 @@ import pytest
 
 from sortie_mcp.db import DB
 from sortie_mcp.models import (
-    CampaignStatus,
-    FailurePolicy,
     StepStatus,
     StepType,
 )
@@ -24,13 +22,9 @@ class TestLinearCampaignHappyPath:
 
     async def test_full_chain(self, db: DB) -> None:
         # --- Setup ---
-        campaign = await db.create_campaign(
-            "Test linear chain", name="Linear"
-        )
+        campaign = await db.create_campaign("Test linear chain", name="Linear")
         a = await db.add_step(campaign.id, "Step A", agent="research")
-        b = await db.add_step(
-            campaign.id, "Step B", agent="writing", depends_on=[a.id]
-        )
+        b = await db.add_step(campaign.id, "Step B", agent="writing", depends_on=[a.id])
         c = await db.add_step(
             campaign.id, "Step C", agent="research", depends_on=[b.id]
         )
@@ -135,15 +129,9 @@ class TestParallelGroupCompletion:
             step_type=StepType.PARALLEL_GROUP,
             completion_threshold=2,
         )
-        c1 = await db.add_step(
-            campaign.id, "Child 1", parent_step_id=parent.id
-        )
-        c2 = await db.add_step(
-            campaign.id, "Child 2", parent_step_id=parent.id
-        )
-        c3 = await db.add_step(
-            campaign.id, "Child 3", parent_step_id=parent.id
-        )
+        c1 = await db.add_step(campaign.id, "Child 1", parent_step_id=parent.id)
+        c2 = await db.add_step(campaign.id, "Child 2", parent_step_id=parent.id)
+        c3 = await db.add_step(campaign.id, "Child 3", parent_step_id=parent.id)
 
         # Complete c1 — parent still pending
         await db.claim_step(c1.id)
@@ -167,12 +155,8 @@ class TestParallelGroupCompletion:
             "Parent",
             step_type=StepType.PARALLEL_GROUP,
         )
-        c1 = await db.add_step(
-            campaign.id, "Child 1", parent_step_id=parent.id
-        )
-        c2 = await db.add_step(
-            campaign.id, "Child 2", parent_step_id=parent.id
-        )
+        c1 = await db.add_step(campaign.id, "Child 1", parent_step_id=parent.id)
+        c2 = await db.add_step(campaign.id, "Child 2", parent_step_id=parent.id)
 
         await db.claim_step(c1.id)
         await db.complete_step(c1.id, "Done 1")

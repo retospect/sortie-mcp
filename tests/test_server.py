@@ -30,12 +30,18 @@ def _now() -> datetime:
 
 
 def make_campaign(**overrides) -> Campaign:
+    """Build a test campaign; pins ``weight`` from ``priority`` like
+    :meth:`sortie_mcp.db.DB.create_campaign` does in production."""
+    from sortie_mcp.models import priority_weight
+
+    priority = overrides.get("priority", Priority.NORMAL)
     defaults = dict(
         id=uuid4(),
         name="Test",
         goal="Test goal",
         status=CampaignStatus.ACTIVE,
-        priority=Priority.NORMAL,
+        priority=priority,
+        weight=priority_weight(priority),
         max_depth=4,
         token_budget=None,
         tokens_used=0,
@@ -559,9 +565,7 @@ class TestSearchNotes:
         vec = [0.2] * 384
         with (
             patch("sortie_mcp.server.get_db", return_value=db),
-            patch(
-                "sortie_mcp.server.embed_text", new=AsyncMock(return_value=vec)
-            ),
+            patch("sortie_mcp.server.embed_text", new=AsyncMock(return_value=vec)),
         ):
             result = await search_notes("my query", campaign_id=str(cid), top_k=3)
         assert len(result) == 1
@@ -600,9 +604,7 @@ class TestSearchNotes:
         db.get_notes.return_value = [make_note(campaign_id=cid, id=1)]
         with (
             patch("sortie_mcp.server.get_db", return_value=db),
-            patch(
-                "sortie_mcp.server.embed_text", new=AsyncMock(return_value=None)
-            ),
+            patch("sortie_mcp.server.embed_text", new=AsyncMock(return_value=None)),
         ):
             result = await search_notes("query", campaign_id=str(cid))
         assert len(result) == 1

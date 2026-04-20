@@ -12,16 +12,14 @@ from __future__ import annotations
 import os
 import uuid
 
-import pytest
 import asyncpg
+import pytest
 
 from sortie_mcp.db import DB
 
 
 def _dsn() -> str:
-    return os.environ.get(
-        "TEST_DATABASE_URL", "postgresql://localhost/test_sortie"
-    )
+    return os.environ.get("TEST_DATABASE_URL", "postgresql://localhost/test_sortie")
 
 
 @pytest.fixture(scope="session")

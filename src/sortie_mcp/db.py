@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -26,6 +27,7 @@ from .models import (
     StepStatus,
     StepType,
     compute_fingerprint,
+    priority_weight,
 )
 
 log = logging.getLogger(__name__)
@@ -123,6 +125,9 @@ class DB:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             completed_at=row["completed_at"],
+            # Fair-share columns (migration 0004).
+            slot_seconds_used=float(row["slot_seconds_used"]),
+            weight=float(row["weight"]),
         )
 
     def _row_to_step(self, row: asyncpg.Record) -> Step:
@@ -205,12 +210,16 @@ class DB:
         priority: Priority = Priority.NORMAL,
         status: CampaignStatus = CampaignStatus.ACTIVE,
     ) -> Campaign:
+        # Pin the fair-share weight at INSERT time so it's a stable,
+        # observable property of the row — changing priority later
+        # doesn't retroactively rewrite history.
+        weight = priority_weight(priority)
         row = await self.pool.fetchrow(
             f"""
             INSERT INTO {self._t("campaigns")}
                 (name, goal, status, channel, user_id, max_depth,
-                 token_budget, failure_policy, priority)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 token_budget, failure_policy, priority, weight)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING *
             """,
             name,
@@ -222,6 +231,7 @@ class DB:
             token_budget,
             failure_policy.value,
             priority.value,
+            weight,
         )
         return self._row_to_campaign(row)
 
@@ -683,6 +693,9 @@ class DB:
                 step.campaign_id,
                 tokens_used,
             )
+        # Fair-share accounting (migration 0004): charge slot_seconds to
+        # the campaign so subsequent WDRR picks see higher virtual time.
+        await self._charge_slot_seconds(step)
         return step
 
     async def fail_step(
@@ -732,6 +745,10 @@ class DB:
         # the leases must be dropped so other work / the next attempt can
         # re-acquire them.
         await self.release_leases(step_id)
+        # Fair-share accounting — compute still cost us even on failure,
+        # so charge the campaign the same way we do on success. This
+        # prevents a rapidly-failing campaign from monopolising slots.
+        await self._charge_slot_seconds(step)
         if (
             step.status == StepStatus.FAILED
             and step.failure_policy == FailurePolicy.FAIL_FAST
@@ -1129,6 +1146,62 @@ class DB:
         return row is not None
 
     # ------------------------------------------------------------------
+    # Fair-share accounting (migration 0004)
+    # ------------------------------------------------------------------
+
+    async def _charge_slot_seconds(self, step: Step) -> None:
+        """Add the step's wall-clock duration to its campaign's ledger.
+
+        Called from :meth:`complete_step` and :meth:`fail_step` — both
+        terminal transitions from the scheduler's perspective. The
+        duration is computed from ``started_at`` to either the supplied
+        ``duration_ms`` (complete path) or ``now()`` (fail path).
+
+        Rules of thumb:
+
+        - Never charge a negative number (clock skew between DB and
+          runner hosts can make ``completed_at < started_at`` in
+          pathological cases).
+        - Never charge more than ``SORTIE_MAX_STEP_SECONDS`` (default
+          1 hour). A runaway / stuck step shouldn't permanently starve
+          its campaign — the zombie reaper will recover it, but the
+          already-recorded hour of spend is enough signal to the WDRR.
+        - A ``step.started_at IS NULL`` row (never actually claimed, but
+          completed via some edge path) is charged zero. This also
+          protects the test fixtures that inject bare steps.
+        """
+        if step.started_at is None:
+            return
+        if step.duration_ms is not None:
+            seconds = step.duration_ms / 1000.0
+        else:
+            # fail_step path — the row's ``completed_at`` may be NULL on
+            # a retry-pending transition, so compute from clock.
+            end = step.completed_at
+            if end is None:
+                # Still-running / retrying row. Use a fresh ``now()``
+                # from the DB to keep clocks consistent.
+                row = await self.pool.fetchrow("SELECT now() AS now")
+                end = row["now"]
+            seconds = (end - step.started_at).total_seconds()
+
+        if seconds <= 0:
+            return
+        # Defence-in-depth: cap at 1h per step by default.
+        max_step_seconds = float(os.environ.get("SORTIE_MAX_STEP_SECONDS", "3600"))
+        seconds = min(seconds, max_step_seconds)
+
+        await self.pool.execute(
+            f"""
+            UPDATE {self._t("campaigns")}
+            SET slot_seconds_used = slot_seconds_used + $2
+            WHERE id = $1
+            """,
+            step.campaign_id,
+            seconds,
+        )
+
+    # ------------------------------------------------------------------
     # Parent completion check
     # ------------------------------------------------------------------
 
@@ -1365,20 +1438,37 @@ class DB:
     # ------------------------------------------------------------------
 
     async def get_due_campaigns(self) -> list[Campaign]:
-        """Get active campaigns due for processing, locked."""
+        """Get active campaigns due for processing, locked.
+
+        Ordered by fair-share virtual time (``slot_seconds_used / weight``
+        ASC) so the head-of-list is the campaign most entitled to the
+        next slot. Tiebreakers: ``next_action_at`` (older first), then
+        ``priority`` ordinal (higher tier first) to keep behaviour
+        reasonable on fresh campaigns where everyone has
+        ``slot_seconds_used = 0``.
+
+        Callers who want strict WDRR semantics per-slot should run each
+        picked slot through :func:`sortie_mcp.scheduler.pick_next_campaign`
+        (which re-orders in Python after each dispatch to account for
+        mid-tick accumulation). This SQL ordering is the initial
+        approximation — good enough when multiple slots are dispatched
+        in parallel against a fresh candidate list.
+        """
         rows = await self.pool.fetch(
             f"""
             SELECT * FROM {self._t("campaigns")}
             WHERE status = 'active' AND next_action_at <= now()
             ORDER BY
+                -- Virtual time: smaller = more entitled.
+                (slot_seconds_used / GREATEST(weight, 1e-6)) ASC,
+                next_action_at ASC,
                 CASE priority
                     WHEN 'urgent' THEN 0
                     WHEN 'high' THEN 1
                     WHEN 'normal' THEN 2
                     WHEN 'low' THEN 3
                     WHEN 'background' THEN 4
-                END,
-                next_action_at
+                END ASC
             FOR UPDATE SKIP LOCKED
             """
         )

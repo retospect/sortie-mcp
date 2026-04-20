@@ -15,7 +15,7 @@ TEST_DB_NAME = "sortie_migrate_test"
 DSN = f"postgresql://{PG_USER}@localhost/{TEST_DB_NAME}"
 
 # Total migrations in src/sortie_mcp/migrations/. Bump when adding new ones.
-N_MIGRATIONS = 3
+N_MIGRATIONS = 4
 
 
 def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
